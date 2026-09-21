@@ -1,0 +1,108 @@
+{
+    "taskDefinitionArn": "arn:aws:ecs:ap-south-1:968246764501:task-definition/dograh-ui:7",
+    "containerDefinitions": [
+        {
+            "name": "dograh-ui",
+            "image": "968246764501.dkr.ecr.ap-south-1.amazonaws.com/dograh-ui:latest",
+            "cpu": 0,
+            "portMappings": [
+                {
+                    "containerPort": 3010,
+                    "hostPort": 3010,
+                    "protocol": "tcp",
+                    "name": "dograh-ui-3010-tcp",
+                    "appProtocol": "http"
+                }
+            ],
+            "essential": true,
+            "environment": [
+                {
+                    "name": "NEXT_PUBLIC_NODE_ENV",
+                    "value": "oss"
+                },
+                {
+                    "name": "NODE_ENV",
+                    "value": "production"
+                },
+                {
+                    "name": "BACKEND_URL",
+                    "value": "https://d1ade3v18apdww.cloudfront.net"
+                },
+                {
+                    "name": "NEXT_TELEMETRY_DISABLED",
+                    "value": "1"
+                }
+            ],
+            "environmentFiles": [],
+            "mountPoints": [],
+            "volumesFrom": [],
+            "ulimits": [],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/dograh-ui",
+                    "awslogs-create-group": "true",
+                    "awslogs-region": "ap-south-1",
+                    "awslogs-stream-prefix": "ecs"
+                },
+                "secretOptions": []
+            },
+            "systemControls": []
+        }
+    ],
+    "family": "dograh-ui",
+    "taskRoleArn": "arn:aws:iam::968246764501:role/ecsTaskExecutionRole",
+    "executionRoleArn": "arn:aws:iam::968246764501:role/ecsTaskExecutionRole",
+    "networkMode": "awsvpc",
+    "revision": 7,
+    "volumes": [],
+    "status": "ACTIVE",
+    "requiresAttributes": [
+        {
+            "name": "com.amazonaws.ecs.capability.logging-driver.awslogs"
+        },
+        {
+            "name": "ecs.capability.execution-role-awslogs"
+        },
+        {
+            "name": "com.amazonaws.ecs.capability.ecr-auth"
+        },
+        {
+            "name": "com.amazonaws.ecs.capability.docker-remote-api.1.19"
+        },
+        {
+            "name": "com.amazonaws.ecs.capability.task-iam-role"
+        },
+        {
+            "name": "ecs.capability.execution-role-ecr-pull"
+        },
+        {
+            "name": "com.amazonaws.ecs.capability.docker-remote-api.1.18"
+        },
+        {
+            "name": "ecs.capability.task-eni"
+        },
+        {
+            "name": "com.amazonaws.ecs.capability.docker-remote-api.1.29"
+        }
+    ],
+    "placementConstraints": [],
+    "compatibilities": [
+        "EC2",
+        "FARGATE",
+        "MANAGED_INSTANCES"
+    ],
+    "runtimePlatform": {
+        "cpuArchitecture": "X86_64",
+        "operatingSystemFamily": "LINUX"
+    },
+    "requiresCompatibilities": [
+        "FARGATE"
+    ],
+    "cpu": "1024",
+    "memory": "3072",
+    "registeredAt": "2026-06-10T05:42:37.968Z",
+    "registeredBy": "arn:aws:iam::968246764501:root",
+    "enableFaultInjection": false,
+    "tags": []
+}

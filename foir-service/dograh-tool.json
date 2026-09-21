@@ -1,0 +1,33 @@
+{
+  "name": "calculate_foir_eligibility",
+  "description": "Calculate personal loan eligibility using 70% FOIR model. Call ONLY after net_monthly_income, existing_emi are LOCKED with explicit haan, and tenure_years (5/6/7) is known. Do not guess values.",
+  "method": "POST",
+  "url": "http://foir-service:8089/calculate-foir",
+  "timeout_ms": 8000,
+  "parameters": [
+    {
+      "name": "net_monthly_income",
+      "type": "number",
+      "description": "LOCKED net monthly salary/income after haan confirmation",
+      "required": true
+    },
+    {
+      "name": "existing_emi",
+      "type": "number",
+      "description": "LOCKED existing total EMI, 0 if none, after haan confirmation",
+      "required": true
+    },
+    {
+      "name": "other_obligations",
+      "type": "number",
+      "description": "Other monthly obligations, default 0",
+      "required": false
+    },
+    {
+      "name": "tenure_years",
+      "type": "number",
+      "description": "Loan tenure 5, 6 or 7. Ask customer. Default 6 since all banks offer up to 6 years.",
+      "required": true
+    }
+  ]
+}

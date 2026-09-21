@@ -1,0 +1,559 @@
+{
+    "taskDefinitionArn": "arn:aws:ecs:ap-south-1:968246764501:task-definition/dograh-api:21",
+    "containerDefinitions": [
+        {
+            "name": "dograh-api",
+            "image": "968246764501.dkr.ecr.ap-south-1.amazonaws.com/dograh-api:latest",
+            "cpu": 0,
+            "portMappings": [
+                {
+                    "containerPort": 8000,
+                    "hostPort": 8000,
+                    "protocol": "tcp",
+                    "name": "dograh-api-8000-tcp",
+                    "appProtocol": "http"
+                }
+            ],
+            "essential": true,
+            "command": [
+                "sh",
+                "-c",
+                "alembic -c api/alembic.ini upgrade head && uvicorn api.app:app --host 0.0.0.0 --port 8000"
+            ],
+            "environment": [
+                {
+                    "name": "TURN_SECRET",
+                    "value": "dograh-turn-secret-change-in-production"
+                },
+                {
+                    "name": "ENABLE_AWS_S3",
+                    "value": "false"
+                },
+                {
+                    "name": "OLLAMA_HOST",
+                    "value": "http://127.0.0.1:11434"
+                },
+                {
+                    "name": "UI_APP_URL",
+                    "value": "https://d1skrvdhe4yz1l.cloudfront.net"
+                },
+                {
+                    "name": "ENVIRONMENT",
+                    "value": "production"
+                },
+                {
+                    "name": "TURN_HOST",
+                    "value": "localhost"
+                },
+                {
+                    "name": "MINIO_BUCKET",
+                    "value": "voice-audio"
+                },
+                {
+                    "name": "DATABASE_URL",
+                    "value": "postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/postgres"
+                },
+                {
+                    "name": "MINIO_ACCESS_KEY",
+                    "value": "minioadmin"
+                },
+                {
+                    "name": "MINIO_PUBLIC_ENDPOINT",
+                    "value": "dograh-alb-2113815158.ap-south-1.elb.amazonaws.com:9001"
+                },
+                {
+                    "name": "BACKEND_WS_ENDPOINT",
+                    "value": "ws://dograh-alb-2113815158.ap-south-1.elb.amazonaws.com:8000"
+                },
+                {
+                    "name": "ENABLE_TRACING",
+                    "value": "false"
+                },
+                {
+                    "name": "MINIO_ENDPOINT",
+                    "value": "127.0.0.1:9000"
+                },
+                {
+                    "name": "MINIO_SECURE",
+                    "value": "false"
+                },
+                {
+                    "name": "MINIO_SECRET_KEY",
+                    "value": "minioadmin"
+                },
+                {
+                    "name": "BACKEND_API_ENDPOINT",
+                    "value": "https://d1ade3v18apdww.cloudfront.net"
+                },
+                {
+                    "name": "LOG_LEVEL",
+                    "value": "DEBUG"
+                },
+                {
+                    "name": "REDIS_URL",
+                    "value": "redis://:redissecret@127.0.0.1:6379"
+                }
+            ],
+            "environmentFiles": [],
+            "mountPoints": [],
+            "volumesFrom": [],
+            "ulimits": [],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/dograh-api",
+                    "awslogs-create-group": "true",
+                    "awslogs-region": "ap-south-1",
+                    "awslogs-stream-prefix": "ecs"
+                },
+                "secretOptions": []
+            },
+            "systemControls": []
+        },
+        {
+            "name": "ari-manager",
+            "image": "968246764501.dkr.ecr.ap-south-1.amazonaws.com/dograh-api:latest",
+            "cpu": 0,
+            "portMappings": [],
+            "essential": false,
+            "command": [
+                "python",
+                "-m",
+                "api.services.telephony.ari_manager"
+            ],
+            "environment": [
+                {
+                    "name": "TURN_SECRET",
+                    "value": "dograh-turn-secret-change-in-production"
+                },
+                {
+                    "name": "ENABLE_AWS_S3",
+                    "value": "false"
+                },
+                {
+                    "name": "OLLAMA_HOST",
+                    "value": "http://127.0.0.1:11434"
+                },
+                {
+                    "name": "UI_APP_URL",
+                    "value": "https://d1skrvdhe4yz1l.cloudfront.net"
+                },
+                {
+                    "name": "ENVIRONMENT",
+                    "value": "production"
+                },
+                {
+                    "name": "TURN_HOST",
+                    "value": "localhost"
+                },
+                {
+                    "name": "MINIO_BUCKET",
+                    "value": "voice-audio"
+                },
+                {
+                    "name": "DATABASE_URL",
+                    "value": "postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/postgres"
+                },
+                {
+                    "name": "MINIO_ACCESS_KEY",
+                    "value": "minioadmin"
+                },
+                {
+                    "name": "MINIO_PUBLIC_ENDPOINT",
+                    "value": "dograh-alb-2113815158.ap-south-1.elb.amazonaws.com:9001"
+                },
+                {
+                    "name": "BACKEND_WS_ENDPOINT",
+                    "value": "ws://dograh-alb-2113815158.ap-south-1.elb.amazonaws.com:8000"
+                },
+                {
+                    "name": "ENABLE_TRACING",
+                    "value": "false"
+                },
+                {
+                    "name": "MINIO_ENDPOINT",
+                    "value": "127.0.0.1:9000"
+                },
+                {
+                    "name": "MINIO_SECURE",
+                    "value": "false"
+                },
+                {
+                    "name": "MINIO_SECRET_KEY",
+                    "value": "minioadmin"
+                },
+                {
+                    "name": "BACKEND_API_ENDPOINT",
+                    "value": "https://d1ade3v18apdww.cloudfront.net"
+                },
+                {
+                    "name": "LOG_LEVEL",
+                    "value": "DEBUG"
+                },
+                {
+                    "name": "REDIS_URL",
+                    "value": "redis://:redissecret@localhost:6379"
+                }
+            ],
+            "environmentFiles": [],
+            "mountPoints": [],
+            "volumesFrom": [],
+            "systemControls": []
+        },
+        {
+            "name": "campaign-orchestrator",
+            "image": "968246764501.dkr.ecr.ap-south-1.amazonaws.com/dograh-api:latest",
+            "cpu": 0,
+            "portMappings": [],
+            "essential": false,
+            "command": [
+                "python",
+                "-m",
+                "api.services.campaign.campaign_orchestrator"
+            ],
+            "environment": [
+                {
+                    "name": "TURN_SECRET",
+                    "value": "dograh-turn-secret-change-in-production"
+                },
+                {
+                    "name": "ENABLE_AWS_S3",
+                    "value": "false"
+                },
+                {
+                    "name": "OLLAMA_HOST",
+                    "value": "http://127.0.0.1:11434"
+                },
+                {
+                    "name": "UI_APP_URL",
+                    "value": "https://d1skrvdhe4yz1l.cloudfront.net"
+                },
+                {
+                    "name": "ENVIRONMENT",
+                    "value": "production"
+                },
+                {
+                    "name": "TURN_HOST",
+                    "value": "localhost"
+                },
+                {
+                    "name": "MINIO_BUCKET",
+                    "value": "voice-audio"
+                },
+                {
+                    "name": "DATABASE_URL",
+                    "value": "postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/postgres"
+                },
+                {
+                    "name": "MINIO_ACCESS_KEY",
+                    "value": "minioadmin"
+                },
+                {
+                    "name": "MINIO_PUBLIC_ENDPOINT",
+                    "value": "dograh-alb-2113815158.ap-south-1.elb.amazonaws.com:9001"
+                },
+                {
+                    "name": "BACKEND_WS_ENDPOINT",
+                    "value": "ws://dograh-alb-2113815158.ap-south-1.elb.amazonaws.com:8000"
+                },
+                {
+                    "name": "ENABLE_TRACING",
+                    "value": "false"
+                },
+                {
+                    "name": "MINIO_ENDPOINT",
+                    "value": "127.0.0.1:9000"
+                },
+                {
+                    "name": "MINIO_SECURE",
+                    "value": "false"
+                },
+                {
+                    "name": "MINIO_SECRET_KEY",
+                    "value": "minioadmin"
+                },
+                {
+                    "name": "BACKEND_API_ENDPOINT",
+                    "value": "https://d1ade3v18apdww.cloudfront.net"
+                },
+                {
+                    "name": "LOG_LEVEL",
+                    "value": "DEBUG"
+                },
+                {
+                    "name": "REDIS_URL",
+                    "value": "redis://:redissecret@localhost:6379"
+                }
+            ],
+            "environmentFiles": [],
+            "mountPoints": [],
+            "volumesFrom": [],
+            "systemControls": []
+        },
+        {
+            "name": "arq-worker",
+            "image": "968246764501.dkr.ecr.ap-south-1.amazonaws.com/dograh-api:latest",
+            "cpu": 0,
+            "portMappings": [],
+            "essential": false,
+            "command": [
+                "python",
+                "-m",
+                "arq",
+                "api.tasks.arq.WorkerSettings",
+                "--custom-log-dict",
+                "api.tasks.arq.LOG_CONFIG"
+            ],
+            "environment": [
+                {
+                    "name": "TURN_SECRET",
+                    "value": "dograh-turn-secret-change-in-production"
+                },
+                {
+                    "name": "ENABLE_AWS_S3",
+                    "value": "false"
+                },
+                {
+                    "name": "OLLAMA_HOST",
+                    "value": "http://127.0.0.1:11434"
+                },
+                {
+                    "name": "UI_APP_URL",
+                    "value": "https://d1skrvdhe4yz1l.cloudfront.net"
+                },
+                {
+                    "name": "ENVIRONMENT",
+                    "value": "production"
+                },
+                {
+                    "name": "TURN_HOST",
+                    "value": "localhost"
+                },
+                {
+                    "name": "MINIO_BUCKET",
+                    "value": "voice-audio"
+                },
+                {
+                    "name": "DATABASE_URL",
+                    "value": "postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/postgres"
+                },
+                {
+                    "name": "MINIO_ACCESS_KEY",
+                    "value": "minioadmin"
+                },
+                {
+                    "name": "MINIO_PUBLIC_ENDPOINT",
+                    "value": "dograh-alb-2113815158.ap-south-1.elb.amazonaws.com:9001"
+                },
+                {
+                    "name": "BACKEND_WS_ENDPOINT",
+                    "value": "ws://dograh-alb-2113815158.ap-south-1.elb.amazonaws.com:8000"
+                },
+                {
+                    "name": "ENABLE_TRACING",
+                    "value": "false"
+                },
+                {
+                    "name": "MINIO_ENDPOINT",
+                    "value": "127.0.0.1:9000"
+                },
+                {
+                    "name": "MINIO_SECURE",
+                    "value": "false"
+                },
+                {
+                    "name": "MINIO_SECRET_KEY",
+                    "value": "minioadmin"
+                },
+                {
+                    "name": "BACKEND_API_ENDPOINT",
+                    "value": "https://d1ade3v18apdww.cloudfront.net"
+                },
+                {
+                    "name": "LOG_LEVEL",
+                    "value": "DEBUG"
+                },
+                {
+                    "name": "REDIS_URL",
+                    "value": "redis://:redissecret@127.0.0.1:6379"
+                }
+            ],
+            "environmentFiles": [],
+            "mountPoints": [],
+            "volumesFrom": [],
+            "systemControls": []
+        },
+        {
+            "name": "postgres",
+            "image": "968246764501.dkr.ecr.ap-south-1.amazonaws.com/dograh-postgres-1:latest",
+            "cpu": 0,
+            "portMappings": [],
+            "essential": false,
+            "environment": [
+                {
+                    "name": "POSTGRES_USER",
+                    "value": "postgres"
+                },
+                {
+                    "name": "POSTGRES_PASSWORD",
+                    "value": "postgres"
+                },
+                {
+                    "name": "POSTGRES_DB",
+                    "value": "postgres"
+                },
+                {
+                    "name": "OLLAMA_HOST",
+                    "value": "http://127.0.0.1:11434"
+                },
+                {
+                    "name": "MINIO_PUBLIC_ENDPOINT",
+                    "value": "dograh-alb-2113815158.ap-south-1.elb.amazonaws.com:9001"
+                }
+            ],
+            "environmentFiles": [],
+            "mountPoints": [],
+            "volumesFrom": [],
+            "systemControls": []
+        },
+        {
+            "name": "redis",
+            "image": "968246764501.dkr.ecr.ap-south-1.amazonaws.com/dograh-redis-1:latest",
+            "cpu": 0,
+            "portMappings": [],
+            "essential": false,
+            "command": [
+                "--requirepass",
+                "redissecret"
+            ],
+            "environment": [
+                {
+                    "name": "OLLAMA_HOST",
+                    "value": "http://127.0.0.1:11434"
+                },
+                {
+                    "name": "MINIO_PUBLIC_ENDPOINT",
+                    "value": "dograh-alb-2113815158.ap-south-1.elb.amazonaws.com:9001"
+                }
+            ],
+            "environmentFiles": [],
+            "mountPoints": [],
+            "volumesFrom": [],
+            "systemControls": []
+        },
+        {
+            "name": "minio",
+            "image": "968246764501.dkr.ecr.ap-south-1.amazonaws.com/dograh-minio-1:latest",
+            "cpu": 0,
+            "portMappings": [],
+            "essential": true,
+            "command": [
+                "server",
+                "/data",
+                "--console-address",
+                ":9001"
+            ],
+            "environment": [
+                {
+                    "name": "MINIO_ROOT_PASSWORD",
+                    "value": "minioadmin"
+                },
+                {
+                    "name": "MINIO_API_CORS_ALLOW_ORIGIN",
+                    "value": "*"
+                },
+                {
+                    "name": "MINIO_BUCKET",
+                    "value": "voice-audio"
+                },
+                {
+                    "name": "OLLAMA_HOST",
+                    "value": "http://127.0.0.1:11434"
+                },
+                {
+                    "name": "MINIO_ROOT_USER",
+                    "value": "minioadmin"
+                },
+                {
+                    "name": "MINIO_ACCESS_KEY",
+                    "value": "minioadmin"
+                },
+                {
+                    "name": "MINIO_PUBLIC_ENDPOINT",
+                    "value": "dograh-alb-2113815158.ap-south-1.elb.amazonaws.com:9001"
+                },
+                {
+                    "name": "MINIO_ENDPOINT",
+                    "value": "127.0.0.1:9000"
+                },
+                {
+                    "name": "MINIO_SECURE",
+                    "value": "false"
+                },
+                {
+                    "name": "MINIO_SECRET_KEY",
+                    "value": "minioadmin"
+                }
+            ],
+            "environmentFiles": [],
+            "mountPoints": [],
+            "volumesFrom": [],
+            "systemControls": []
+        }
+    ],
+    "family": "dograh-api",
+    "taskRoleArn": "arn:aws:iam::968246764501:role/ecsTaskExecutionRole",
+    "executionRoleArn": "arn:aws:iam::968246764501:role/ecsTaskExecutionRole",
+    "networkMode": "awsvpc",
+    "revision": 21,
+    "volumes": [],
+    "status": "ACTIVE",
+    "requiresAttributes": [
+        {
+            "name": "com.amazonaws.ecs.capability.logging-driver.awslogs"
+        },
+        {
+            "name": "ecs.capability.execution-role-awslogs"
+        },
+        {
+            "name": "com.amazonaws.ecs.capability.ecr-auth"
+        },
+        {
+            "name": "com.amazonaws.ecs.capability.docker-remote-api.1.19"
+        },
+        {
+            "name": "com.amazonaws.ecs.capability.task-iam-role"
+        },
+        {
+            "name": "ecs.capability.execution-role-ecr-pull"
+        },
+        {
+            "name": "com.amazonaws.ecs.capability.docker-remote-api.1.18"
+        },
+        {
+            "name": "ecs.capability.task-eni"
+        },
+        {
+            "name": "com.amazonaws.ecs.capability.docker-remote-api.1.29"
+        }
+    ],
+    "placementConstraints": [],
+    "compatibilities": [
+        "EC2",
+        "FARGATE",
+        "MANAGED_INSTANCES"
+    ],
+    "runtimePlatform": {
+        "cpuArchitecture": "X86_64",
+        "operatingSystemFamily": "LINUX"
+    },
+    "requiresCompatibilities": [
+        "FARGATE"
+    ],
+    "cpu": "4096",
+    "memory": "12288",
+    "registeredAt": "2026-06-21T05:40:21.698Z",
+    "registeredBy": "arn:aws:iam::968246764501:user/Saurabh",
+    "enableFaultInjection": false,
+    "tags": []
+}
