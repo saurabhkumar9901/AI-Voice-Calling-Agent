@@ -1,0 +1,234 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+
+  redis:
+    image: redis:7
+    command: --requirepass redissecret
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redissecret", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+
+  minio:
+    image: quay.io/minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_API_CORS_ALLOW_ORIGIN: "*"
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+
+
+
+  # Main API Server (FastAPI)
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    command: >
+      sh -c "alembic -c api/alembic.ini upgrade head && uvicorn api.app:app --host 0.0.0.0 --port 8000"
+    env_file:
+      - api/.env
+    volumes:
+      # Shared with arq-worker: on_pipeline_finished writes call audio/transcript
+      # temp files here and process_workflow_completion (running in arq-worker)
+      # reads them. Without this, each container has its own /tmp and uploads
+      # silently fail with "temp file not found".
+      - shared-tmp:/tmp
+    environment:
+      ENVIRONMENT: "local"
+      LOG_LEVEL: "INFO"
+      LOG_TO_FILE: "false"  # Log to stdout for cloud logging (CloudWatch)
+      DATABASE_URL: "postgresql+asyncpg://postgres:postgres@postgres:5432/postgres"
+      REDIS_URL: "redis://:redissecret@redis:6379"
+      ENABLE_AWS_S3: "false"  # Change to true if using real S3 on AWS
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: "minioadmin"
+      MINIO_SECRET_KEY: "minioadmin"
+      MINIO_BUCKET: "voice-audio"
+      MINIO_SECURE: "false"
+      MINIO_PUBLIC_ENDPOINT: "localhost:9000"
+      # Add other environment variables as needed (e.g. GEMINI_API_KEY)
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'python -c "import urllib.request; urllib.request.urlopen(''http://localhost:8000/api/v1/health'').read()"',
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+    networks:
+      - app-network
+
+  # ARI Manager (Telephony Bridge)
+  ari-manager:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    command: python -m api.services.telephony.ari_manager
+    env_file:
+      - api/.env
+    environment:
+      ENVIRONMENT: "local"
+      LOG_LEVEL: "INFO"
+      LOG_TO_FILE: "false"
+      DATABASE_URL: "postgresql+asyncpg://postgres:postgres@postgres:5432/postgres"
+      REDIS_URL: "redis://:redissecret@redis:6379"
+      ENABLE_AWS_S3: "false"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: "minioadmin"
+      MINIO_SECRET_KEY: "minioadmin"
+      MINIO_BUCKET: "voice-audio"
+      MINIO_SECURE: "false"
+      MINIO_PUBLIC_ENDPOINT: "localhost:9000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  # Campaign Orchestrator (Outbound Campaign Manager)
+  campaign-orchestrator:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    command: python -m api.services.campaign.campaign_orchestrator
+    env_file:
+      - api/.env
+    environment:
+      ENVIRONMENT: "local"
+      LOG_LEVEL: "INFO"
+      LOG_TO_FILE: "false"
+      DATABASE_URL: "postgresql+asyncpg://postgres:postgres@postgres:5432/postgres"
+      REDIS_URL: "redis://:redissecret@redis:6379"
+      ENABLE_AWS_S3: "false"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: "minioadmin"
+      MINIO_SECRET_KEY: "minioadmin"
+      MINIO_BUCKET: "voice-audio"
+      MINIO_SECURE: "false"
+      MINIO_PUBLIC_ENDPOINT: "localhost:9000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  # Background Queue Worker (ARQ)
+  arq-worker:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    command: python -m arq api.tasks.arq.WorkerSettings --custom-log-dict api.tasks.arq.LOG_CONFIG
+    env_file:
+      - api/.env
+    volumes:
+      # Must match api's mount: completion jobs read the /tmp files produced
+      # by the pipeline running in the api container.
+      - shared-tmp:/tmp
+    environment:
+      ENVIRONMENT: "local"
+      LOG_LEVEL: "INFO"
+      LOG_TO_FILE: "false"
+      DATABASE_URL: "postgresql+asyncpg://postgres:postgres@postgres:5432/postgres"
+      REDIS_URL: "redis://:redissecret@redis:6379"
+      ENABLE_AWS_S3: "false"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: "minioadmin"
+      MINIO_SECRET_KEY: "minioadmin"
+      MINIO_BUCKET: "voice-audio"
+      MINIO_SECURE: "false"
+      MINIO_PUBLIC_ENDPOINT: "localhost:9000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  # Frontend Dashboard (Next.js)
+  ui:
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+    environment:
+      NODE_ENV: "production"
+      BACKEND_URL: "http://api:8000"
+      NEXT_PUBLIC_NODE_ENV: "oss"
+      NEXT_TELEMETRY_DISABLED: "1"
+    ports:
+      - "3000:3010"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  # FOIR Eligibility micro-service (standalone, internal only)
+  foir-service:
+    build:
+      context: ./foir-service
+      dockerfile: Dockerfile
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8089/health').read()\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  shared-tmp:
+networks:
+  app-network:
+    driver: bridge
