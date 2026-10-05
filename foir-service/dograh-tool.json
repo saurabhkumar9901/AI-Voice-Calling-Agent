@@ -8,19 +8,19 @@
     {
       "name": "net_monthly_income",
       "type": "number",
-      "description": "LOCKED net monthly salary/income after haan confirmation",
+      "description": "LOCKED net monthly salary/income in full Indian Rupees (e.g. 500000 for 5 lakh, 50000 for 50k)",
       "required": true
     },
     {
       "name": "existing_emi",
       "type": "number",
-      "description": "LOCKED existing total EMI, 0 if none, after haan confirmation",
+      "description": "LOCKED existing total EMI in full Indian Rupees (e.g. 50000 for 50k, 0 if none)",
       "required": true
     },
     {
       "name": "other_obligations",
       "type": "number",
-      "description": "Other monthly obligations, default 0",
+      "description": "Other monthly obligations in full Indian Rupees, default 0",
       "required": false
     },
     {
@@ -31,3 +31,4 @@
     }
   ]
 }
+
