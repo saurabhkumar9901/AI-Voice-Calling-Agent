@@ -1,0 +1,25 @@
+[Unit]
+Description=Dograh AI (Docker Compose, remote profile)
+Documentation=https://github.com/dograh-hq/dograh
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Change this if you installed somewhere other than /home/opc/dograh
+# (e.g. /home/ubuntu/dograh on an Ubuntu image).
+WorkingDirectory=/home/opc/dograh
+User=opc
+Group=docker
+Environment=COMPOSE_PROJECT_NAME=dograh
+
+ExecStartPre=/usr/bin/docker compose -f docker-compose.yaml -f docker-compose.oci.yaml config -q
+ExecStart=/usr/bin/docker compose -f docker-compose.yaml -f docker-compose.oci.yaml --profile remote up -d --remove-orphans
+ExecStop=/usr/bin/docker compose -f docker-compose.yaml -f docker-compose.oci.yaml --profile remote down
+TimeoutStartSec=900
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

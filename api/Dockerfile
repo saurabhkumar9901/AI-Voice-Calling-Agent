@@ -13,6 +13,12 @@ RUN apt-get update && apt-get install -y \
 # Copy and install requirements
 COPY api/requirements.txt .
 
+# Retry/timeout settings: package index requests can be slow or flaky, and a
+# single failed index page aborts the whole layer with "from versions: none"
+ENV PIP_RETRIES=10 \
+    PIP_TIMEOUT=120 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
 # Install CPU-only PyTorch FIRST to prevent CUDA/NVIDIA dependencies
 # This satisfies torch dependency before other packages try to pull GPU version
 RUN pip install --user --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \

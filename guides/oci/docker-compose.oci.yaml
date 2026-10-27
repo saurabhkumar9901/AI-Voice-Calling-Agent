@@ -1,0 +1,115 @@
+# OCI / production overrides for the upstream docker-compose.yaml.
+#
+# Usage (always pass both files, in this order):
+#   docker compose -f docker-compose.yaml -f docker-compose.oci.yaml \
+#     --profile remote up -d
+#
+# Requires Docker Compose v2.24.4+ because it uses the `!reset` / `!override`
+# YAML tags. All values below come from `.env` (see
+# guides/oci_deployment_guide.md).
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  postgres:
+    restart: unless-stopped
+    logging: *default-logging
+    # Never expose the database outside the compose network.
+    ports: !reset []
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+
+  redis:
+    restart: unless-stopped
+    logging: *default-logging
+    ports: !reset []
+    command:
+      - --requirepass
+      - ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+      - --appendonly
+      - "yes"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    restart: unless-stopped
+    logging: *default-logging
+    # MinIO's community image (minio/minio) is no longer anonymously pullable
+    # (Docker Hub 404, Quay requires AIStor credentials). Default to SILO
+    # (pgsty/silo), the maintained MinIO fork: same entrypoint/env/CLI, keeps
+    # the /minio/* routes, bundles curl + mcli, multi-arch amd64/arm64.
+    # Pin a release tag in MINIO_IMAGE for reproducible deploys.
+    image: ${MINIO_IMAGE:-pgsty/silo:latest}
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
+
+  api:
+    restart: unless-stopped
+    logging: *default-logging
+    # Only nginx needs to reach the app ports. Bind them to loopback so an
+    # accidentally permissive NSG/security list cannot expose them directly.
+    # Docker publishes ports past firewalld, so the OS firewall is not enough.
+    ports: !override
+      - "127.0.0.1:8000:8000"
+    # cloudflared is opt-in (profile "tunnel") for this deployment: telephony
+    # webhooks arrive on the public domain, so no quick tunnel is needed.
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      # Public URL used by telephony webhooks and returned by /api/v1/health.
+      BACKEND_API_ENDPOINT: ${BACKEND_API_ENDPOINT:?Set BACKEND_API_ENDPOINT in .env}
+      # Keep credentials in sync with the postgres/redis/minio services above.
+      DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      OSS_JWT_SECRET: ${OSS_JWT_SECRET:?Set OSS_JWT_SECRET in .env}
+      TURN_PORT: ${TURN_PORT:-3478}
+      # Set TURN_TLS_PORT=0 in .env unless coturn is configured with a
+      # certificate (see guide). 0 stops the API advertising turns:// URIs.
+      TURN_TLS_PORT: ${TURN_TLS_PORT:-0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+  ui:
+    restart: unless-stopped
+    logging: *default-logging
+    ports: !override
+      - "127.0.0.1:3010:3010"
+    environment:
+      # Browser-side API client base URL: must be the public HTTPS origin.
+      # The /api rewrite compiled into the image still targets http://api:8000.
+      BACKEND_URL: ${BACKEND_URL:?Set BACKEND_URL to the public https origin in .env}
+
+  nginx:
+    restart: unless-stopped
+    logging: *default-logging
+    # Mount point used by certbot --webroot for renewals without downtime.
+    volumes:
+      - ./certbot/www:/var/www/certbot:ro
+
+  coturn:
+    restart: unless-stopped
+    logging: *default-logging
+
+  cloudflared:
+    restart: unless-stopped
+    logging: *default-logging
+    # Opt in only if you need a public trycloudflare.com URL (e.g. local
+    # webhook testing): docker compose --profile remote --profile tunnel up -d
+    profiles: ["tunnel"]
+    # Metrics stay private to the VM.
+    ports: !override
+      - "127.0.0.1:2000:2000"
