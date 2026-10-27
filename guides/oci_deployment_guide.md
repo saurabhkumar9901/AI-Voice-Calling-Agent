@@ -146,6 +146,31 @@ private and nginx is the only intended entry point.
 > OCI security lists and NSGs are additive: leaving the default security list
 > in place (SSH/ICMP) is fine, the NSG rules above just add to it.
 
+#### Two ways to finish Path A
+
+From here Path A splits into two variants. Sections A2 and A3 are shared.
+
+| Variant | What runs | Public entry point | Needs a domain? | Sections |
+|---|---|---|---|---|
+| **1. Build from source + ngrok** (the deployment we actually ran) | **Your fork** (`saurabhkumar9901/AI-Voice-Calling-Agent`) built on the VM with `docker-compose-ecs.yaml` + `docker-compose.ngrok.yaml`, plus nginx and coturn | ngrok static domain (`https://<name>.ngrok-free.dev`) | No | A2, A3, **N1–N12** |
+| **2. Upstream images + custom domain** | Upstream `dograh-hq` images from GHCR with `docker-compose.oci.yaml` | Your domain + Let's Encrypt on nginx 80/443 | Yes | A2, A3, A4–A9 |
+
+Use **Variant 1** if you have code changes in your fork (custom services such as
+`foir-service`, modified API/UI) or no domain. Variant 2 pulls the stock
+Dograh images, so your fork's changes would **not** be included.
+
+**Ingress rules for Variant 1 (ngrok).** ngrok makes an *outbound* connection,
+so the UI needs **no** inbound port. Only SSH and TURN must be open:
+
+| Source | Protocol | Destination port | Why |
+|---|---|---|---|
+| Your admin IP (or `0.0.0.0/0`) | TCP | 22 | SSH |
+| `0.0.0.0/0` | TCP + UDP | 3478 | TURN (call audio) |
+| `0.0.0.0/0` | UDP | 49152-49200 | TURN relay range (call audio) |
+
+Ports 80/443 are only needed for Variant 2. Never open 3000, 3010, 8000, 8080,
+9000 or 9001 in either variant.
+
 Optional, reproducible provisioning from **OCI Cloud Shell** (no local CLI
 needed):
 
@@ -225,19 +250,552 @@ Console: **Instance → Attached VNICs → VNIC → Public IP → Unassign**, th
 **Assign public IP → Reserved** (you can also pre-create one under
 **Networking → Reserved public IPs** and assign it here). Note the address down.
 
+#### If the launch fails: "Out of capacity for shape VM.Standard.A1.Flex"
+
+Exact console error:
+
+```
+API Error: Out of capacity for shape VM.Standard.A1.Flex in availability domain AD-1.
+Create the instance in a different availability domain or try again later. If you
+specified a fault domain, try creating the instance without specifying a fault domain.
+```
+
+This is **not** a configuration mistake. Oracle simply has no free Ampere hosts
+in that availability domain at the moment (very common on Always Free). The
+VCN, subnet and NSG are fine and can be kept. Options, easiest first:
+
+1. **Another availability domain.** In **Create instance → Placement**, switch
+   AD-1 to AD-2/AD-3 and set the fault domain to **"Let Oracle choose the best
+   fault domain"**.
+   - If the AD dropdown is locked, the subnet is AD-specific. Create a
+     **Regional** subnet (see the troubleshooting table).
+   - Single-AD regions (for example **Mumbai `ap-mumbai-1`** and **Hyderabad
+     `ap-hyderabad-1`**) have nothing to switch to: retry later or use the
+     options below.
+2. **Ask for a smaller shape.** 1 OCPU / 6 GB or 2 OCPU / 12 GB fits more
+   often. Once the instance exists, **Edit → Shape** back to 4 OCPU / 24 GB
+   (needs a reboot, and only succeeds if capacity exists at that moment).
+3. **Retry automatically from Cloud Shell.** Capacity frees up periodically
+   (often late night / early morning). A failed launch creates nothing, so
+   retrying is safe:
+
+   ```bash
+   export C=<compartment-ocid> T=<tenancy-ocid> SUBNET=<subnet-ocid> IMG=<aarch64-image-ocid>
+   ADS=$(oci iam availability-domain list -c "$T" --query 'data[].name' --raw-output | jq -r '.[]')
+
+   while true; do
+     for AD in $ADS; do
+       echo "$(date) trying $AD"
+       if oci compute instance launch -c "$C" --availability-domain "$AD" \
+           --shape VM.Standard.A1.Flex --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+           --image-id "$IMG" --subnet-id "$SUBNET" --assign-public-ip true \
+           --display-name dograh --hostname-label dograh \
+           --ssh-authorized-keys-file ~/.ssh/id_ed25519.pub \
+           --boot-volume-size-in-gbs 150 --user-data-file cloud-init.sh; then
+         echo "Launched in $AD"; break 2
+       fi
+     done
+     sleep 120
+   done
+   ```
+
+   Upload `cloud-init.sh` to Cloud Shell first. Cloud Shell disconnects after
+   inactivity, so keep the tab active or run the loop from a PC with the OCI CLI.
+4. **Upgrade to Pay As You Go** (**Billing → Upgrade and Manage Payment**).
+   Many users report paid accounts get A1 capacity far more easily (not
+   guaranteed by Oracle). Always Free resources stay free after upgrading as
+   long as you stay within the limits (4 OCPU / 24 GB A1, 200 GB block storage).
+   Set a **budget alert** as a safety net.
+5. **Use x86 instead (paid):** `VM.Standard.E5.Flex`, 4 OCPU / 16 GB, usually
+   available immediately. The Dograh images and Dockerfiles work on both
+   architectures; choose an x86_64 image instead of aarch64.
+
+> Do **not** use the free `VM.Standard.E2.1.Micro` — 1 GB RAM is far too small
+> for this stack. Always Free resources only exist in your **home region**, so
+> switching regions does not help on the free tier.
+
 ### A3. Host checks
 
 ```bash
-ssh opc@<reserved-public-ip>        # or ubuntu@...
+ssh opc@<reserved-public-ip>        # Oracle Linux
+ssh ubuntu@<reserved-public-ip>     # Ubuntu (the user for Ubuntu images is "ubuntu")
 docker --version && docker compose version
 sudo swapon --show
 nproc && free -h                    # expect 4 CPUs / ~24 GB on A1.Flex
 ```
 
+MobaXterm or any SSH client works the same way: host = reserved public IP,
+user = `ubuntu` (or `opc`), key = the private key matching the public key you
+gave OCI.
+
 If you did not use the cloud-init script, install Docker manually and open the
 firewall — see `cloud-init.sh` for the exact commands. Common OCI gotcha:
 **Oracle Linux 9 ships firewalld enabled**, so ports opened in the NSG still
-appear closed until `firewall-cmd` rules are added.
+appear closed until `firewall-cmd` rules are added. **Oracle's Ubuntu images
+ship iptables rules that reject everything except SSH** (see N5).
+
+#### A3.1 Installing Docker + Compose on Ubuntu (if cloud-init did not run)
+
+Symptoms that Docker or the Compose v2 plugin is missing:
+
+```text
+$ docker compose -f docker-compose-ecs.yaml up -d --build
+unknown shorthand flag: 'f' in -f        # docker exists, but the "compose" plugin does not
+
+$ docker compose version
+Command 'docker' not found, but can be installed with:
+sudo apt install docker.io               # do NOT install this one
+sudo apt install podman-docker           # or this one
+```
+
+Install Docker's **official** packages (works on arm64 and x86_64; the example
+VM ran Ubuntu 22.04 "jammy"):
+
+```bash
+# 1. Remove distro packages if present (keeps images/volumes in /var/lib/docker)
+sudo apt-get remove -y docker.io docker-compose docker-compose-v2 podman-docker containerd runc 2>/dev/null
+
+# 2. Add Docker's apt repository (these two commands print nothing on success)
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+# 3. Install engine + Compose v2 + buildx (buildx is required for --build)
+sudo apt-get update            # look for "download.docker.com ... jammy stable" with no errors
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# 4. Start on boot, and allow your user to run docker without sudo
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER
+newgrp docker
+
+# 5. Verify
+docker --version
+docker compose version         # must be v2.24.4 or newer (needed for !override / !reset)
+docker run --rm hello-world
+```
+
+Right after step 1, `docker` is gone (`Command 'docker' not found`). That is
+expected until step 3 finishes. If `apt-get update` shows `NO_PUBKEY`, `404`
+or `is not signed`, or `apt-get install` says `Unable to locate package
+docker-ce`, the repository setup is wrong. Check it with
+`cat /etc/apt/sources.list.d/docker.list`: it should contain `arch=arm64` (on
+A1) and end with `ubuntu jammy stable` (or your release codename), then redo
+step 2.
+
+---
+
+## Variant 1 — Build from source + ngrok (no domain)
+
+This is the exact setup that was deployed and verified: the fork is cloned onto
+the VM, built locally, and published through a static ngrok domain. It meets
+these goals:
+
+1. The app keeps running when the SSH session closes or your PC is off.
+2. The UI is reachable by anyone over HTTPS.
+3. Browser calls, phone calls and voice work.
+4. ngrok is run by hand on the VM.
+
+```mermaid
+graph LR
+    B["Browser / phone provider"] -->|"HTTPS"| NG["ngrok edge<br/>name.ngrok-free.dev"]
+    NG -->|"outbound tunnel"| AG["ngrok agent on VM<br/>(tmux)"]
+    AG --> NX["nginx<br/>127.0.0.1:8080"]
+    NX -->|"/"| UI["ui :3010<br/>(host 127.0.0.1:3000)"]
+    UI -->|"/api/* + WebSockets (Next rewrite)"| API["api :8000"]
+    NX -->|"/voice-audio/"| MINIO["minio :9000"]
+    B -.->|"WebRTC audio, UDP 3478 + 49152-49200"| CT["coturn<br/>(host network)"]
+```
+
+#### Why not run `docker-compose-ecs.yaml` on its own?
+
+`docker-compose-ecs.yaml` was written for AWS ECS, where the load balancer,
+TLS and secrets come from AWS. On a bare VM it has these gaps, which
+`docker-compose.ngrok.yaml` fixes without touching the ECS file:
+
+| Gap in `docker-compose-ecs.yaml` | Effect on a VM | Fixed by |
+|---|---|---|
+| No HTTPS (UI on plain `:3000`) | Browsers block the microphone on `http://<ip>`, so test calls fail | ngrok HTTPS |
+| No coturn | The VM only knows its private `10.0.1.x` address; calls can connect with **no audio** on mobile/corporate networks | `coturn` service |
+| UI `BACKEND_URL: http://api:8000` | The UI cannot hand that to the browser, so [`route.ts`](../ui/src/app/api/config/version/route.ts) falls back to `http://localhost:8000` and remote API calls fail | `BACKEND_URL=${PUBLIC_URL}` |
+| `MINIO_PUBLIC_ENDPOINT: localhost:9000` | Uploads and recording playback break for remote users | nginx `/voice-audio/` + `sub_filter` |
+| 8000, 9000, 9001, 3000 published on all interfaces | Docker bypasses the host firewall | rebinds to `127.0.0.1` |
+| No `restart:` policy | Containers stay down after a crash or reboot | `restart: unless-stopped` |
+| `pgsty/minio` image | Renamed upstream | `pgsty/silo` |
+| `TURN_HOST=localhost` in `api/.env` | API tells browsers to use a TURN server on *their own PC* | `TURN_HOST=${PUBLIC_IP}` |
+
+Files involved (all in the repo except the two generated on the VM):
+
+| File | Purpose |
+|---|---|
+| [`docker-compose-ecs.yaml`](../docker-compose-ecs.yaml) | Base services: postgres, redis, minio, api, ari-manager, campaign-orchestrator, arq-worker, ui, foir-service (all built from source) |
+| [`docker-compose.ngrok.yaml`](../docker-compose.ngrok.yaml) | Override: restart policies, loopback-only ports, public URL/TURN env for all API-image services, nginx, coturn |
+| [`nginx/ngrok.conf`](../nginx/ngrok.conf) | Plain-HTTP front door for ngrok (ngrok terminates TLS) with `/voice-audio/` and MinIO URL rewriting |
+| `api/.env` | Your existing API settings (gitignored, copied from your PC) |
+| `.env` (repo root, **generated on VM**) | `PUBLIC_URL`, `PUBLIC_IP`, `PRIVATE_IP`, `TURN_SECRET` for compose interpolation |
+| `turnserver.conf` (repo root, **generated on VM**) | coturn config with the TURN secret (gitignored) |
+
+### N1. Clone the repository
+
+```bash
+cd ~
+git clone https://github.com/saurabhkumar9901/AI-Voice-Calling-Agent.git
+cd ~/AI-Voice-Calling-Agent        # = /home/ubuntu/AI-Voice-Calling-Agent
+```
+
+- `pipecat/` is committed as normal files in this fork (not a submodule), so
+  `--recursive` is **not** needed.
+- If the repository is **private**, use a GitHub Personal Access Token as the
+  password when prompted.
+- Because the folder is `AI-Voice-Calling-Agent`, the compose project name is
+  `ai-voice-calling-agent` and the Docker network is
+  **`ai-voice-calling-agent_app-network`** (check with `docker network ls`).
+
+### N2. Copy `api/.env` to the VM
+
+`api/.env` is gitignored, so it is not in the clone, but every API-image
+service in `docker-compose-ecs.yaml` requires it (`env_file: api/.env`).
+From your **Windows PC** (PowerShell):
+
+```powershell
+scp "d:\dograh 19-08\dograh\api\.env" ubuntu@<public-ip>:~/AI-Voice-Calling-Agent/api/.env
+```
+
+(MobaXterm users can also drag the file into the SFTP side panel.)
+
+What matters inside `api/.env` on the VM:
+
+| Variable | Action | Why |
+|---|---|---|
+| `BACKEND_API_ENDPOINT` (e.g. an old ngrok URL from your PC) | Nothing to do — the override sets it to `PUBLIC_URL` | Used to build the **telephony webhook and media WebSocket URLs** ([`common.py`](../api/utils/common.py)) and call-report links. It does **not** affect the browser; the UI's `BACKEND_URL` wins |
+| `TURN_HOST=localhost` | Overridden to `PUBLIC_IP`. Comment it out if you ever run the ECS file **without** the override | `localhost` tells browsers to use a TURN server on their own machine |
+| `DATABASE_URL`, `REDIS_URL`, `MINIO_ENDPOINT`, `LOG_LEVEL` (with `localhost`) | Leave as is | Overridden by the `environment:` block in `docker-compose-ecs.yaml` |
+| `UI_APP_URL=http://localhost:3000` | Overridden to `PUBLIC_URL` | Used for links |
+| Your provider keys (Gemini, etc.) | Keep | Loaded into the API containers |
+| `OSS_JWT_SECRET` | **Add it** on the VM: `echo "OSS_JWT_SECRET=$(openssl rand -hex 32)" >> api/.env` | Not set anywhere else; the code default `change-me-in-production` is public, so anyone could forge login tokens |
+
+`environment:` in compose always wins over `env_file:`, which is why the
+`localhost` values are harmless.
+
+### N3. Get the override files
+
+`docker-compose.ngrok.yaml` and `nginx/ngrok.conf` are committed to the repo.
+If you cloned before they were pushed:
+
+```bash
+cd ~/AI-Voice-Calling-Agent && git pull
+```
+
+### N4. OCI ingress rules and reserved IP
+
+In the VCN **Security List** (or the `dograh-nsg` NSG) add ingress, source
+`0.0.0.0/0`:
+
+- TCP + UDP **3478**
+- UDP **49152-49200**
+
+Do **not** open 3000/8000/8080 — ngrok is outbound-only. Make sure the public
+IP is **reserved** (A2): TURN advertises it, so it must not change.
+
+### N5. Open the same ports in the VM's iptables (Ubuntu)
+
+Oracle's Ubuntu images reject all inbound traffic except SSH at the host level,
+even when the security list allows it. coturn uses host networking, so it
+needs these rules:
+
+```bash
+sudo iptables -I INPUT -p udp --dport 3478 -j ACCEPT
+sudo iptables -I INPUT -p tcp --dport 3478 -j ACCEPT
+sudo iptables -I INPUT -p udp --dport 49152:49200 -j ACCEPT
+sudo apt-get install -y iptables-persistent && sudo netfilter-persistent save
+```
+
+(On Oracle Linux use `firewall-cmd` instead — `cloud-init.sh` already does it.)
+
+### N6. Create the root `.env` and `turnserver.conf`
+
+Both files go in the **repo root on the VM**, next to `docker-compose-ecs.yaml`.
+This is a **second** `.env`, separate from `api/.env`:
+
+| File | Full path on the VM |
+|---|---|
+| Root `.env` | `/home/ubuntu/AI-Voice-Calling-Agent/.env` |
+| `turnserver.conf` | `/home/ubuntu/AI-Voice-Calling-Agent/turnserver.conf` |
+
+```
+/home/ubuntu/AI-Voice-Calling-Agent/
+├── .env                        ← NEW (PUBLIC_URL, PUBLIC_IP, PRIVATE_IP, TURN_SECRET)
+├── turnserver.conf             ← NEW (coturn config)
+├── docker-compose-ecs.yaml
+├── docker-compose.ngrok.yaml
+├── nginx/
+│   └── ngrok.conf
+├── api/
+│   └── .env                    ← copied in N2 (leave as is)
+└── ui/
+```
+
+- Docker Compose automatically reads `.env` from the folder you run it in and
+  uses it to fill `${PUBLIC_URL}`, `${PUBLIC_IP}` and `${TURN_SECRET}` in the
+  override.
+- The override mounts `./turnserver.conf` from the same folder.
+- `api/.env` is unrelated; only the API containers load it.
+
+Run this **from the repo root** (replace the ngrok domain with yours):
+
+```bash
+cd /home/ubuntu/AI-Voice-Calling-Agent
+
+cat > .env <<EOF
+PUBLIC_URL=https://willian-conditional-semistiffly.ngrok-free.dev
+PUBLIC_IP=$(curl -s https://ifconfig.me)
+PRIVATE_IP=$(ip -4 route get 1.1.1.1 | awk '{print $7}')
+TURN_SECRET=$(openssl rand -hex 32)
+EOF
+chmod 600 .env
+set -a; . ./.env; set +a
+
+cat > turnserver.conf <<EOF
+listening-port=3478
+min-port=49152
+max-port=49200
+external-ip=${PUBLIC_IP}/${PRIVATE_IP}
+relay-ip=${PRIVATE_IP}
+realm=dograh
+use-auth-secret
+static-auth-secret=${TURN_SECRET}
+fingerprint
+no-tls
+no-dtls
+no-cli
+no-multicast-peers
+log-file=stdout
+EOF
+
+cat .env      # PUBLIC_IP = reserved public IP, PRIVATE_IP = 10.0.x.x
+ls -la .env turnserver.conf
+```
+
+Never create these on your PC or push them: both hold the TURN secret and are
+in `.gitignore`. Do not regenerate `TURN_SECRET` casually — if you do,
+regenerate `turnserver.conf` too and recreate the stack (N8).
+
+`ui/.env` on your PC is not used by Docker (the UI Dockerfile does not copy
+it), so ignore it here.
+
+### N7. Install ngrok and run it in tmux
+
+```bash
+curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+echo "deb https://ngrok-agent.s3.amazonaws.com bookworm main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+sudo apt-get update && sudo apt-get install -y ngrok tmux
+ngrok config add-authtoken <your-authtoken>     # dashboard.ngrok.com → Your Authtoken
+```
+
+**Stop ngrok on your PC first.** A free static domain can only be online from
+one agent at a time.
+
+```bash
+tmux new -s ngrok
+ngrok http --url=https://willian-conditional-semistiffly.ngrok-free.dev 8080
+```
+
+Expected output:
+
+```text
+Session Status    online
+Forwarding        https://willian-conditional-semistiffly.ngrok-free.dev -> http://localhost:8080
+```
+
+Detach with **Ctrl+B, then D**. ngrok keeps running in the background.
+
+| tmux command | What it does |
+|---|---|
+| `tmux ls` | List sessions (must show `ngrok: 1 windows ...`) |
+| `tmux attach -t ngrok` | Re-open the ngrok screen |
+| Ctrl+B, then D | Detach (leave it running) |
+| `pgrep -a ngrok` | Check the process is alive |
+
+> If you start ngrok **directly in the SSH terminal (not in tmux)**, closing
+> the terminal stops ngrok and the site goes offline with `ERR_NGROK_3200`.
+
+### N8. Build and start the stack
+
+```bash
+cd ~/AI-Voice-Calling-Agent
+docker compose version        # v2.24.4+ required for !override
+
+D="docker compose -f docker-compose-ecs.yaml -f docker-compose.ngrok.yaml"
+$D up -d --build
+$D ps
+```
+
+- The first build on A1 (ARM) takes **~15–30 minutes**, mostly installing
+  CPU torch and pipecat. Watch it from a second SSH window with
+  `$D logs -f api`.
+- The API runs Alembic migrations on start; its healthcheck has a 180 s
+  start period, so `api` shows `starting` for up to ~3 minutes.
+- `ui` waits for `api` to be healthy; `nginx` waits for `ui` and `minio`.
+
+Always pass **both** `-f` files, in this order, for every compose command
+(`ps`, `logs`, `restart`, `down`, ...). The `D=...` alias saves typing.
+
+### N9. Start on boot
+
+```bash
+sudo systemctl enable docker
+```
+
+(Output `Synchronizing state of docker.service with SysV service script...`
+is normal.) Every container has `restart: unless-stopped`, so the whole stack
+comes back after a crash or VM reboot. **ngrok in tmux does not** survive a
+reboot — see N11.
+
+### N10. Verify and open the site
+
+On the VM, check each layer:
+
+```bash
+$D ps                                       # api healthy; ui, nginx, coturn running
+curl -s  localhost:8000/api/v1/health       # API  → JSON
+curl -sI localhost:3000 | head -1           # UI   → HTTP/1.1 200
+curl -sI localhost:8080 | head -1           # nginx → HTTP/1.1 200
+tmux attach -t ngrok                        # "Session Status online"  (Ctrl+B, D to leave)
+```
+
+Then open, from any device:
+
+**`https://<your-name>.ngrok-free.dev`** (here:
+`https://willian-conditional-semistiffly.ngrok-free.dev`)
+
+- The free ngrok plan shows a "You are about to visit…" page first: click
+  **Visit Site**.
+- Test it on a phone using **mobile data** to prove it works without your PC
+  or network.
+
+First-use steps:
+
+1. **Sign up** — creates the first account (local OSS auth, stored on the VM).
+2. **Model Configurations** — add your LLM / STT / TTS keys.
+3. Open an agent and start a **web call**; allow the microphone.
+4. If you use Vobiz / Twilio / Cloudonix, point the provider's webhook at the
+   same ngrok domain. It now reaches the VM instead of your PC.
+
+### N11. Closing the SSH session (MobaXterm) and reboots
+
+Before closing MobaXterm:
+
+```bash
+tmux ls                                                  # must show: ngrok: 1 windows ...
+docker ps --format "table {{.Names}}\t{{.Status}}"       # containers Up / healthy
+```
+
+If both look right, close MobaXterm or turn your PC off.
+
+| Component | Close MobaXterm / turn off PC | VM reboots |
+|---|---|---|
+| Docker containers | Keep running | Restart automatically (`restart: unless-stopped` + `systemctl enable docker`) |
+| ngrok in tmux | Keeps running | **Stops** — SSH in and run N7's `tmux new -s ngrok` + `ngrok http ...` again |
+
+**Optional: make ngrok survive reboots too** (replaces the tmux session).
+Write the tunnel into the ngrok config:
+
+```yaml
+# /home/ubuntu/.config/ngrok/ngrok.yml
+version: 3
+agent:
+  authtoken: <your-authtoken>
+endpoints:
+  - name: dograh
+    url: https://willian-conditional-semistiffly.ngrok-free.dev
+    upstream:
+      url: 8080
+```
+
+```bash
+tmux kill-session -t ngrok          # stop the manual agent first (same domain)
+sudo ngrok service install --config /home/ubuntu/.config/ngrok/ngrok.yml
+sudo ngrok service start
+systemctl status ngrok --no-pager
+```
+
+### N12. Operate
+
+**Update to the latest code from your fork**
+
+```bash
+cd ~/AI-Voice-Calling-Agent
+git pull
+$D up -d --build
+docker image prune -f               # remove old image layers
+```
+
+The root `.env`, `turnserver.conf` and `api/.env` are gitignored, so `git pull`
+never overwrites them.
+
+**Logs and restarts**
+
+```bash
+$D logs -f --tail=100 api
+$D logs --tail=50 ui nginx coturn
+$D restart api
+$D up -d --force-recreate api ari-manager campaign-orchestrator arq-worker   # after editing api/.env
+```
+
+**Disk** — builds are large. Check with `df -h` and `docker system df`; clean
+with `docker builder prune -f`.
+
+**Free ngrok plan limits**
+
+- Browser visitors see ngrok's warning page once; telephony webhooks are not
+  affected.
+- There is a **monthly bandwidth cap**. Phone-call audio streams through ngrok
+  (WebSocket media); browser-call audio does **not** (it goes over WebRTC/TURN
+  directly). With heavy phone traffic, use a paid ngrok plan or Variant 2 with
+  your own domain.
+- One static domain, one online agent at a time.
+
+#### Other ways to expose the UI (testing only)
+
+**SSH tunnel — zero changes, only you can use it.** Run
+`docker compose -f docker-compose-ecs.yaml up -d --build` (no override), then
+on your PC:
+
+```powershell
+ssh -L 3000:localhost:3000 -L 8000:localhost:8000 -L 9000:localhost:9000 ubuntu@<public-ip>
+```
+
+Open `http://localhost:3000`. The browser treats `localhost` as secure, so the
+mic works, and the `localhost:8000` / `localhost:9000` URLs the app hands out go
+through the tunnel. It stops when the SSH session closes.
+
+**Cloudflare quick tunnel — public HTTPS, random URL.**
+
+```bash
+docker run -d --name ui-tunnel --restart unless-stopped --network ai-voice-calling-agent_app-network \
+  cloudflare/cloudflared:latest tunnel --no-autoupdate --url http://nginx:80
+docker logs ui-tunnel 2>&1 | grep trycloudflare.com
+```
+
+Put that URL in `PUBLIC_URL` and recreate the stack. The URL changes every time
+the tunnel restarts, so it is only good for quick tests.
+
+**Opening port 3000 directly** gives plain HTTP: the dashboard loads but the
+browser blocks the microphone. Not recommended.
+
+#### Running the services without Docker
+
+Possible (Python 3.12, Node 20, Postgres + pgvector, Redis, MinIO and ffmpeg on
+ARM), but it gives no benefit: you still need HTTPS and TURN, and you lose the
+restart policies. Use Docker.
+
+---
+
+## Variant 2 — Upstream images + custom domain (A4–A9)
 
 ### A4. DNS
 
@@ -755,13 +1313,28 @@ TURN stays outside the LB: coturn needs UDP 3478 and the relay range
 | Compose error on `!reset` / `!override` | Docker Compose older than v2.24.4 | Upgrade the compose plugin (`docker compose version`); the port isolation in the override depends on those tags |
 | `pgsty/silo` logs "unknown command" or restarts | You changed the image to a distroless/mis-tagged build | Use a `pgsty/silo:RELEASE.*` tag; the compose command `server /data --console-address ":9001"` must stay |
 | Document upload returns 403/404 through the domain | `sub_filter` did not rewrite the MinIO URL (gzip body) or the route is missing | Keep `proxy_set_header Accept-Encoding "";` and the `/voice-audio/` location; `docker compose logs nginx` shows the request |
-| A1 launch fails: "Out of host capacity" | Free-tier ARM capacity | Retry another AD/region or use `VM.Standard.E5.Flex` |
+| A1 launch fails: "Out of capacity for shape VM.Standard.A1.Flex in availability domain AD-1" | No free Ampere hosts in that AD right now (not a config error) | Another AD with fault domain left to Oracle; smaller shape then resize; Cloud Shell retry loop; Pay As You Go upgrade; or `VM.Standard.E5.Flex` — see **A2 → If the launch fails** |
 | Public IP changed after stop/start | Ephemeral public IP | Assign a **reserved** public IP, then update DNS and `turnserver.conf` |
 | Disk full / containers restarting | 50 GB boot volume + Docker images + audio | Use 150 GB+, `docker system prune -af`, move audio to Object Storage |
 | UI loads, but API calls fail against `http://localhost:8000` | UI runtime `BACKEND_URL` is the internal `http://api:8000`; the browser cannot reach it | Set `BACKEND_URL=https://voice.example.com` for the `ui` container (browser client) and leave the compiled rewrite target at `http://api:8000` |
 | Certificate renewal broke the site | Certbot copied `fullchain1.pem` (stale after renew) | Copy from `/etc/letsencrypt/live/<domain>/` in the deploy hook |
+| `unknown shorthand flag: 'f' in -f` on `docker compose -f ...` | The Docker Compose v2 plugin is not installed (distro `docker.io`) | Install Docker's official packages incl. `docker-compose-plugin` — **A3.1** |
+| `Command 'docker' not found` right after removing `docker.io` | Old packages removed, new ones not installed yet | Finish A3.1 step 3. Do **not** install `docker.io` / `podman-docker` |
+| `apt-get update`: `NO_PUBKEY` / `404` / `is not signed` for download.docker.com | Key download or repo line is wrong | Redo A3.1 step 2; `/etc/apt/sources.list.d/docker.list` must show your arch and codename |
+| `Unable to locate package docker-ce` | Docker repo not added / `apt-get update` not run after adding it | Redo A3.1 steps 2–3 |
+| `got permission denied while trying to connect to the Docker daemon socket` | User not in the `docker` group yet | `sudo usermod -aG docker $USER && newgrp docker` (or log out and back in) |
+| `env file .../api/.env not found` | `api/.env` is gitignored and was not copied | `scp` it from your PC — **N2** |
+| `required variable PUBLIC_URL is missing a value` | Root `.env` missing, or compose run from another folder | Create `/home/ubuntu/AI-Voice-Calling-Agent/.env` and run compose from that folder — **N6** |
+| `pull access denied` for `pgsty/minio` | Image renamed | The ngrok override already uses `pgsty/silo`; when running the ECS file alone, change the image to `pgsty/silo` |
+| Browser: `ERR_NGROK_3200` "endpoint … is offline" | No ngrok agent is connected for the domain (not started, started outside tmux and the SSH session closed, or VM rebooted) | `tmux ls` / `pgrep -a ngrok`; start it again in tmux — **N7** |
+| ngrok: `ERR_NGROK_334` endpoint already online | The same domain is still running on your PC (or a second agent on the VM) | Stop the other agent, then retry |
+| ngrok: `ERR_NGROK_4018` / authentication failed | No authtoken on the VM | `ngrok config add-authtoken <token>` |
+| Browser: `ERR_NGROK_8012` / 502 | ngrok is up but nothing answers on 8080 | `curl -sI localhost:8080`; `$D ps` — nginx and ui must be running; `$D logs nginx ui` |
+| Page loads but login / API calls fail (ngrok variant) | UI not using the public URL, or api unhealthy | `$D logs ui api`; check `PUBLIC_URL` in the root `.env` and recreate `ui` |
+| Call connects but no audio (ngrok variant) | TURN not reachable | `$D logs coturn`; OCI ingress 3478 TCP/UDP + 49152-49200 UDP (N4); iptables rules (N5); `PUBLIC_IP`/`PRIVATE_IP` correct in `.env` and `turnserver.conf` |
+| Site works only while MobaXterm is open | ngrok was started directly in the terminal | Run it inside `tmux` (N7) or as a service (N11) |
 
-Useful commands:
+Useful commands (Variant 2):
 
 ```bash
 docker compose -f docker-compose.yaml -f docker-compose.oci.yaml ps
@@ -769,6 +1342,19 @@ docker compose -f docker-compose.yaml -f docker-compose.oci.yaml logs -f api
 docker stats --no-stream
 ss -lntup | grep -E ':(80|443|3478|5349|8000|3010)\b'
 curl -vk https://voice.example.com/api/v1/health
+```
+
+Useful commands (Variant 1, run from `~/AI-Voice-Calling-Agent`):
+
+```bash
+D="docker compose -f docker-compose-ecs.yaml -f docker-compose.ngrok.yaml"
+$D ps
+$D logs -f --tail=100 api
+docker stats --no-stream
+ss -lntup | grep -E ':(3000|3478|8000|8080|9000)\b'   # 3000/8000/8080/9000 must show 127.0.0.1 only
+curl -s localhost:8000/api/v1/health
+tmux ls && pgrep -a ngrok
+curl -sI https://willian-conditional-semistiffly.ngrok-free.dev | head -1
 ```
 
 ---
@@ -801,6 +1387,20 @@ curl -vk https://voice.example.com/api/v1/health
 - [ ] Monitoring alarms (CPU, disk, health endpoint, LB 5xx) and log retention set
 - [ ] `cloudflared` not running (it is opt-in via `--profile tunnel`); enable only if a provider needs the quick tunnel
 
+**Variant 1 (build from source + ngrok)**
+
+- [ ] Public IP is **reserved**; `PUBLIC_IP` in the root `.env` and `external-ip` in `turnserver.conf` match it
+- [ ] OCI ingress: 22, 3478 TCP/UDP, 49152-49200 UDP only; iptables rules saved with `netfilter-persistent`
+- [ ] `ss -lntup` shows 3000/8000/8080/9000/9001 on `127.0.0.1` only
+- [ ] **`OSS_JWT_SECRET` set in `api/.env`.** Neither `docker-compose-ecs.yaml` nor the override sets it, and the code default is the public string `change-me-in-production` ([`constants.py`](../api/constants.py)), which lets anyone forge login tokens on a public site. Fix: `echo "OSS_JWT_SECRET=$(openssl rand -hex 32)" >> api/.env` then `$D up -d --force-recreate api ari-manager campaign-orchestrator arq-worker` (existing sessions are logged out)
+- [ ] Root `.env`, `turnserver.conf` and `api/.env` are `chmod 600` and never committed
+- [ ] Postgres/Redis/MinIO still use the ECS file's default passwords; acceptable only because they are not published outside the VM — keep it that way
+- [ ] ngrok runs in tmux or as a service; ngrok on your PC is stopped
+- [ ] `sudo systemctl enable docker` done; a `sudo reboot` test brings the containers back (then restart ngrok if it is in tmux)
+- [ ] Browser call tested from a phone on mobile data; telephony webhook points at the ngrok domain
+- [ ] Boot-volume backup policy assigned; `pg_dump` taken before big updates:
+      `$D exec -T postgres pg_dump -U postgres postgres > backup-$(date +%F).sql`
+
 ---
 
 ## 7. Related files
@@ -808,9 +1408,12 @@ curl -vk https://voice.example.com/api/v1/health
 | File | Purpose |
 |---|---|
 | [`guides/oci/cloud-init.sh`](oci/cloud-init.sh) | First-boot host prep (Docker, swap, firewall) |
-| [`guides/oci/docker-compose.oci.yaml`](oci/docker-compose.oci.yaml) | Restart policies, log caps, credentials from `.env`, closes 5432/6379, binds 8000/3010 to loopback, swaps the object-storage image to SILO, makes `cloudflared` opt-in |
-| [`guides/oci/nginx.conf.template`](oci/nginx.conf.template) | Domain-based TLS reverse proxy with ACME webroot + `/voice-audio/` |
-| [`guides/oci/dograh.service`](oci/dograh.service) | systemd unit so the stack survives reboots |
+| [`guides/oci/docker-compose.oci.yaml`](oci/docker-compose.oci.yaml) | Variant 2: restart policies, log caps, credentials from `.env`, closes 5432/6379, binds 8000/3010 to loopback, swaps the object-storage image to SILO, makes `cloudflared` opt-in |
+| [`guides/oci/nginx.conf.template`](oci/nginx.conf.template) | Variant 2: domain-based TLS reverse proxy with ACME webroot + `/voice-audio/` |
+| [`guides/oci/dograh.service`](oci/dograh.service) | Variant 2: systemd unit so the stack survives reboots |
+| [`docker-compose-ecs.yaml`](../docker-compose-ecs.yaml) | Variant 1 base: all services built from source |
+| [`docker-compose.ngrok.yaml`](../docker-compose.ngrok.yaml) | Variant 1 override: restart policies, loopback ports, public URL + TURN env, nginx, coturn |
+| [`nginx/ngrok.conf`](../nginx/ngrok.conf) | Variant 1: plain-HTTP front door for ngrok with `/voice-audio/` rewrite |
 
 Upstream references: [`docs/deployment/docker.mdx`](../docs/deployment/docker.mdx),
 [`docs/deployment/custom-domain.mdx`](../docs/deployment/custom-domain.mdx),
