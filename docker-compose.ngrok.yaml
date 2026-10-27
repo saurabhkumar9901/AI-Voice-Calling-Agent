@@ -1,0 +1,102 @@
+# Single-VM deployment behind ngrok (e.g. OCI / any cloud VM).
+#
+# Layer it on top of docker-compose-ecs.yaml:
+#   docker compose -f docker-compose-ecs.yaml -f docker-compose.ngrok.yaml up -d --build
+#
+# Requirements:
+#   - Docker Compose v2.24.4+ (uses the !override tag)
+#   - A root-level .env (next to this file, NOT api/.env) with:
+#       PUBLIC_URL=https://<your-ngrok-domain>
+#       PUBLIC_IP=<vm public ip>
+#       PRIVATE_IP=<vm private ip, e.g. 10.0.1.23>
+#       TURN_SECRET=<random hex>
+#   - ./turnserver.conf generated on the VM (contains TURN_SECRET; gitignore it)
+#   - ngrok on the host:  ngrok http --url=$PUBLIC_URL 8080
+#
+# Traffic flow:
+#   internet -> ngrok -> nginx (127.0.0.1:8080) -> ui:3010 (and /api/* -> api via Next rewrite)
+#                                               -> minio:9000 for /voice-audio/
+#   browser  <-> coturn (public UDP 3478 + 49152-49200) for WebRTC audio
+
+x-restart: &restart
+  restart: unless-stopped
+
+x-public-env: &public-env
+  # Public URL used for telephony webhooks / media WebSockets and report links.
+  BACKEND_API_ENDPOINT: ${PUBLIC_URL:?Set PUBLIC_URL in the root .env}
+  UI_APP_URL: ${PUBLIC_URL}
+  # coturn on this VM. TLS TURN is disabled (0) because coturn has no cert.
+  TURN_HOST: ${PUBLIC_IP:?Set PUBLIC_IP in the root .env}
+  TURN_SECRET: ${TURN_SECRET:?Set TURN_SECRET in the root .env}
+  TURN_PORT: "3478"
+  TURN_TLS_PORT: "0"
+
+services:
+  postgres:
+    <<: *restart
+
+  redis:
+    <<: *restart
+
+  minio:
+    <<: *restart
+    # pgsty/minio was renamed to pgsty/silo (same server, multi-arch).
+    image: pgsty/silo:latest
+    ports: !override
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+
+  api:
+    <<: *restart
+    ports: !override
+      - "127.0.0.1:8000:8000"
+    environment: *public-env
+
+  ari-manager:
+    <<: *restart
+    environment: *public-env
+
+  campaign-orchestrator:
+    <<: *restart
+    environment: *public-env
+
+  arq-worker:
+    <<: *restart
+    environment: *public-env
+
+  ui:
+    <<: *restart
+    ports: !override
+      - "127.0.0.1:3000:3010"
+    environment:
+      # Public origin handed to the browser. With http://api:8000 the UI tells
+      # the browser to call http://localhost:8000, which breaks remote users.
+      BACKEND_URL: ${PUBLIC_URL}
+
+  foir-service:
+    <<: *restart
+
+  # Front door for ngrok. Needed so recording/document URLs that the API emits
+  # as http://localhost:9000/voice-audio/... are rewritten to the public URL.
+  nginx:
+    <<: *restart
+    image: nginx:alpine
+    depends_on:
+      - ui
+      - minio
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ./nginx/ngrok.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - app-network
+
+  # TURN relay so call audio works from any network (mobile, corporate NAT).
+  # Host networking avoids Docker NAT on the 49152-49200 relay range.
+  coturn:
+    <<: *restart
+    image: coturn/coturn:4.8.0
+    network_mode: host
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]

@@ -15,5 +15,6 @@ venv/
 .venv/
 .playwright-mcp
 coturn/
+turnserver.conf
 *.wav
 dograh_pcm_cache/
