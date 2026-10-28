@@ -128,13 +128,27 @@ public_ip_of() {
 # Capacity report is telemetry, not a reservation: it can say AVAILABLE and
 # the launch can still lose the race a second later. Useful for the logs and
 # for fault-domain visibility, never as a gate.
+#
+# Failures are reported inline instead of being swallowed: an UNKNOWN on every
+# single run usually means the user lacks COMPUTE_CAPACITY_REPORT_* permission
+# or the shape is not reportable in that region, and that is worth seeing.
 probe_capacity() {
-  oci compute compute-capacity-report create \
-    --compartment-id "$COMPARTMENT_ID" \
-    --availability-domain "$AVAILABILITY_DOMAIN" \
-    --shape-availabilities "[{\"instanceShape\":\"VM.Standard.A1.Flex\",\"instanceShapeConfig\":{\"ocpus\":${OCPUS},\"memoryInGBs\":${MEMORY_GBS}}}]" \
-    --query 'data."shape-availabilities"[0]."availability-status"' \
-    --raw-output 2>/dev/null || echo "UNKNOWN"
+  local output
+  if output="$(oci compute compute-capacity-report create \
+      --compartment-id "$COMPARTMENT_ID" \
+      --availability-domain "$AVAILABILITY_DOMAIN" \
+      --shape-availabilities "[{\"instanceShape\":\"VM.Standard.A1.Flex\",\"instanceShapeConfig\":{\"ocpus\":${OCPUS},\"memoryInGBs\":${MEMORY_GBS}}}]" \
+      --query 'data."shape-availabilities"[0]."availability-status"' \
+      --raw-output 2>&1)"; then
+    if [[ -n "$output" && "$output" != "null" ]]; then
+      printf '%s' "$output"
+      return 0
+    fi
+    printf 'UNKNOWN (empty response)'
+    return 0
+  fi
+
+  printf 'UNKNOWN (%s)' "$(printf '%s' "$output" | head -n 1 | cut -c1-140)"
 }
 
 launch_instance() {
