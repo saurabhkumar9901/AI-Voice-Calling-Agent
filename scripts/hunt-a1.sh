@@ -105,11 +105,14 @@ disable_self() {
 # while the CLI times out would otherwise create a second instance.
 existing_instance() {
   local id
+  # Do NOT swallow errors here. A failed list call means we cannot tell whether
+  # an instance exists, and treating that as "none exists" is how a broken
+  # credential quietly turns into a running hunt that can never succeed.
   id="$(oci compute instance list \
     --compartment-id "$COMPARTMENT_ID" \
     --all \
     --query "data[?\"shape\"=='VM.Standard.A1.Flex' && \"display-name\"=='${DISPLAY_NAME}' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'] | [0].id" \
-    --raw-output 2>/dev/null || true)"
+    --raw-output)" || return 2
 
   [[ "$id" == "null" ]] && id=""
   printf '%s' "$id"
@@ -265,8 +268,21 @@ Do not run \`terraform destroy\` — losing this instance means re-entering the 
 }
 
 adopt_if_present() {
-  local id
-  id="$(existing_instance)"
+  local id rc=0
+  id="$(existing_instance)" || rc=$?
+
+  if [[ "$rc" -eq 2 ]]; then
+    err "Could not list compute instances. This is an API/auth failure, not"
+    err "a capacity problem — fix the credential before letting the schedule run."
+    notify "A1 hunter stopped — cannot list instances (auth)" \
+"The guard query failed, so the hunter cannot tell whether an instance already exists.
+
+Most likely causes: \`OCI_CLI_FINGERPRINT\` does not match the private key in \`OCI_CLI_KEY_CONTENT_B64\`, the key was deleted in OCI, or \`OCI_CLI_USER\` is wrong.
+
+Check the **Verify key matches fingerprint** step in this run's log."
+    exit 1
+  fi
+
   if [[ -n "$id" ]]; then
     # The launch may have succeeded while the CLI reported a timeout.
     warn "An A1 instance already exists; adopting it instead of launching another."

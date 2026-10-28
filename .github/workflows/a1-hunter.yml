@@ -67,6 +67,23 @@ jobs:
           printf '%s' "$OCI_KEY_B64" | base64 -d > "$RUNNER_TEMP/oci_api_key.pem"
           test -s "$RUNNER_TEMP/oci_api_key.pem"
 
+      - name: Verify key matches fingerprint
+        env:
+          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/oci_api_key.pem"
+          computed="$(openssl pkey -in "$key" -pubout -outform DER | openssl md5 -c | awk '{print $2}')"
+          echo "key file:            $(wc -c < "$key") bytes"
+          echo "key type:            $(openssl pkey -in "$key" -noout -text 2>/dev/null | head -n1 | tr -d ' ')"
+          echo "computed fingerprint: $computed"
+          echo "configured fingerprint: $OCI_CLI_FINGERPRINT"
+          if [ "$computed" != "$OCI_CLI_FINGERPRINT" ]; then
+            echo "::error::The private key in OCI_CLI_KEY_CONTENT_B64 does not match OCI_CLI_FINGERPRINT ($computed vs $OCI_CLI_FINGERPRINT). Every API call would fail with NotAuthenticated."
+            exit 1
+          fi
+          echo "OK: key and fingerprint agree."
+
       - name: Hunt
         env:
           OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
