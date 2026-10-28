@@ -11,7 +11,8 @@
 ###   DRY_RUN=1 bash scripts/hunt-a1.sh     # probe capacity, never launch
 ###   bash scripts/hunt-a1.sh               # hunt
 ###
-### Tunables (env): MAX_ATTEMPTS, RETRY_SECONDS, JITTER_SECONDS
+### Tunables (env): MAX_ATTEMPTS, RETRY_SECONDS, JITTER_SECONDS,
+###                  CHAIN_DELAY_SECONDS, CHAIN_DELAY_THROTTLED
 ###
 ### Auth: standard OCI CLI env vars (OCI_CLI_USER, OCI_CLI_TENANCY,
 ### OCI_CLI_FINGERPRINT, OCI_CLI_KEY_FILE, OCI_CLI_REGION). No ~/.oci/config
@@ -48,6 +49,34 @@ err()  { printf '%s  %s%s%s\n' "$(date -u +%H:%M:%SZ)" "$RED" "$*" "$NC" >&2; }
 summary() {
   [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] && printf '%s\n' "$*" >> "$GITHUB_STEP_SUMMARY"
   return 0
+}
+
+###############################################################################
+### Chaining
+###
+### GitHub's `schedule` trigger is best-effort. For a newly added workflow it
+### is routinely queued hours late or dropped outright, which is close to
+### useless for catching a capacity window that may only last minutes.
+###
+### `workflow_dispatch` is the one event GITHUB_TOKEN is explicitly allowed to
+### raise, so instead of trusting cron, every run that does not win queues its
+### own successor. The hunt then runs continuously at a fixed cadence, and cron
+### (whenever it finally fires) is only a backstop that restarts a dead chain.
+###
+### This is inert outside Actions: with no GITHUB_OUTPUT the calls do nothing.
+###############################################################################
+
+CHAIN_DELAY_SECONDS="${CHAIN_DELAY_SECONDS:-180}"
+CHAIN_DELAY_THROTTLED="${CHAIN_DELAY_THROTTLED:-420}"
+
+chain_next() {
+  [[ -n "${GITHUB_OUTPUT:-}" ]] || return 0
+  printf 'won=0\nnext_delay=%s\n' "$1" >> "$GITHUB_OUTPUT"
+}
+
+chain_won() {
+  [[ -n "${GITHUB_OUTPUT:-}" ]] || return 0
+  printf 'won=1\nnext_delay=0\n' >> "$GITHUB_OUTPUT"
 }
 
 ###############################################################################
@@ -251,6 +280,9 @@ report_success() {
   state="$(instance_state "$id")"
   ip="$(public_ip_of "$id")"
 
+  # Tell the workflow not to queue a successor: the hunt is over.
+  chain_won
+
   ok "Instance is up."
   log "  ocid:  $id"
   log "  state: $state"
@@ -345,9 +377,10 @@ main() {
         warn "Out of host capacity — will retry."
         ;;
       throttle)
-        warn "Rate limited by OCI. Ending this run instead of sleeping — the next"
-        warn "scheduled run in ~10 minutes is the backoff."
-        summary "Rate limited; backing off until the next scheduled run."
+        warn "Rate limited by OCI. Ending this run rather than sleeping in place;"
+        warn "the next hunt is queued with a longer gap."
+        chain_next "$CHAIN_DELAY_THROTTLED"
+        summary "Rate limited; the next hunt is queued in ${CHAIN_DELAY_THROTTLED}s."
         exit 0
         ;;
       limit)
@@ -399,8 +432,9 @@ $output
     fi
   done
 
-  warn "No capacity in ${MAX_ATTEMPTS} attempts. The schedule will try again."
-  summary "No capacity after ${MAX_ATTEMPTS} attempts."
+  warn "No capacity in ${MAX_ATTEMPTS} attempts. Queueing the next hunt."
+  chain_next "$CHAIN_DELAY_SECONDS"
+  summary "No capacity after ${MAX_ATTEMPTS} attempts; the next hunt is queued in ${CHAIN_DELAY_SECONDS}s."
   exit 0
 }
 

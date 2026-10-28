@@ -334,7 +334,7 @@ destroys the instance afterwards, because getting it back is the hard part.
 | `scripts/a1.env` | Non-secret target config: region, AD, shape, image, subnet, NSG, cloud-init |
 | `scripts/hunt-a1.sh` | Guard → launch → classify → notify loop |
 | `scripts/main.tf`, `variables.tf`, `outputs.tf` | Terraform source of truth **after** the instance exists |
-| `.github/workflows/a1-hunter.yml` | `*/10` schedule + manual dispatch |
+| `.github/workflows/a1-hunter.yml` | Self-chaining hunt; `7,37` cron only as a restart backstop |
 
 Why not Vercel: Hobby crons fire **once per day** inside a one-hour window, and
 per-minute crons need Pro ($20/mo) with a 300 s function cap. This repo is
@@ -358,11 +358,40 @@ Setup:
 3. Point `scripts/a1.env` at your image, subnet and NSG OCIDs (the defaults are
    the Mumbai ones this guide uses).
 4. Actions → **a1-hunter** → **Run workflow** with `dry_run` ticked to verify
-   auth and the guard, then let the schedule run.
+   auth and the guard, then start it for real once without `dry_run`.
+
+**The schedule does not carry the hunt.** GitHub's `schedule` trigger is
+best-effort and, for a newly added workflow, is routinely queued hours late or
+dropped outright — it has been observed firing zero times in an hour. So each
+run that does not win queues its own successor through `workflow_dispatch` (the
+one event `GITHUB_TOKEN` is allowed to raise), and the hunt becomes continuous:
+roughly 7 minutes of attempts, a short gap, then the next run. The `7,37` cron
+is only a backstop that restarts the chain if it ever dies.
+
+Practical consequences:
+
+- A single run is not the end of the hunt. Each one queues the next; nothing
+  else needs to be running.
+- `gh run list -w a1-hunter.yml` shows a steady stream of `workflow_dispatch`
+  runs about every 10 minutes. That is the chain, not someone clicking.
+- If a run is rate-limited by OCI (`429`), it queues its successor with a
+  longer gap instead of hammering the API in place.
+
+To stop it: **Actions → a1-hunter → Disable workflow** (or
+`gh workflow disable a1-hunter.yml`). A winning run disables it automatically,
+and the chain step refuses to queue a successor once the hunt has won.
 
 The loop retries only on `OutOfHostCapacity`. Auth failures, tenancy limits and
 invalid parameters fail the run and open an issue — silently retrying a broken
 config is how this kind of automation wastes a week while looking healthy.
+Those runs do **not** queue a successor, so a broken configuration stops the
+hunt instead of looping on it.
+
+Every `oci` call is made with `--no-retry`. Without it the SDK treats
+`Out of host capacity` (a `500`) as retryable and silently re-sends the request
+for ~110 seconds, which both wastes the run's attempt budget and multiplies the
+request count against OCI's per-user rate limit — the cause of spurious `429`s.
+With `--no-retry` a capacity rejection returns in ~3 seconds.
 
 When it wins it prints the OCID and public IP, and disables the workflow. Adopt
 it into Terraform:
@@ -1479,7 +1508,7 @@ curl -sI https://willian-conditional-semistiffly.ngrok-free.dev | head -1
 | [`scripts/hunt-a1.sh`](../scripts/hunt-a1.sh) | A1 capacity hunter: retry loop, error classification, self-disable on success |
 | [`scripts/a1.env`](../scripts/a1.env) | Non-secret target config for the hunter |
 | [`scripts/main.tf`](../scripts/main.tf) | Terraform source of truth after the instance exists (`prevent_destroy`) |
-| [`.github/workflows/a1-hunter.yml`](../.github/workflows/a1-hunter.yml) | `*/10` schedule + manual `dry_run` dispatch |
+| [`.github/workflows/a1-hunter.yml`](../.github/workflows/a1-hunter.yml) | Self-chaining hunt + `dry_run` dispatch; cron is only a restart backstop |
 | [`guides/oci/docker-compose.oci.yaml`](oci/docker-compose.oci.yaml) | Variant 2: restart policies, log caps, credentials from `.env`, closes 5432/6379, binds 8000/3010 to loopback, swaps the object-storage image to SILO, makes `cloudflared` opt-in |
 | [`guides/oci/nginx.conf.template`](oci/nginx.conf.template) | Variant 2: domain-based TLS reverse proxy with ACME webroot + `/voice-audio/` |
 | [`guides/oci/dograh.service`](oci/dograh.service) | Variant 2: systemd unit so the stack survives reboots |

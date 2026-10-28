@@ -21,10 +21,17 @@
 name: a1-hunter
 
 on:
+  # Both triggers are needed, but neither alone is sufficient:
+  #   - `schedule` is the restart mechanism, and it is unreliable: for a new
+  #     workflow GitHub can queue it hours late or drop it entirely, so it
+  #     cannot be what keeps the hunt alive.
+  #   - `workflow_dispatch` is what keeps it alive: each run queues its own
+  #     successor (see "Queue the next hunt"), which is the one event
+  #     GITHUB_TOKEN is allowed to raise.
+  #
+  # Off-peak minutes, because GitHub delays cron hardest at :00 and :30.
   schedule:
-    # GitHub's minimum is 5 minutes and delivery is best-effort: expect jitter
-    # of up to ~15 minutes under load. The job loops internally between fires.
-    - cron: "*/10 * * * *"
+    - cron: "7,37 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -32,8 +39,11 @@ on:
         type: boolean
         default: false
 
-# Never let two hunts overlap; a queued run is cancelled in favour of the
-# newest one, which is exactly the behaviour we want.
+# Serialise runs. Chains are single-file by construction (one successor per
+# run, and "Queue the next hunt" refuses to add a second), so a queued run
+# only happens if cron or a human dispatches during a hunt. Those are allowed
+# to wait rather than cancel, because a cancelled run would fork nothing but
+# waste the attempts it had already made.
 concurrency:
   group: a1-hunter
   cancel-in-progress: false
@@ -46,7 +56,9 @@ permissions:
 jobs:
   hunt:
     runs-on: ubuntu-latest
-    # Must finish before the next cron fire (10 min) to avoid pile-up.
+    # Budget: ~7.5 min of hunting (4 attempts) + the chain delay (3 min)
+    # before the successor is queued. 12 min leaves headroom for a slow job
+    # start without letting a stuck run hold the chain.
     timeout-minutes: 12
 
     steps:
@@ -85,6 +97,7 @@ jobs:
           echo "OK: key and fingerprint agree."
 
       - name: Hunt
+        id: hunt
         env:
           OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
           OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
@@ -99,3 +112,35 @@ jobs:
       - name: Remove the API key
         if: always()
         run: rm -f "$RUNNER_TEMP/oci_api_key.pem"
+
+      # Self-chaining. `schedule` is unreliable enough that the hunt cannot
+      # depend on it; this step is what actually keeps it running. Exits
+      # without queueing when the hunt won (the workflow disables itself),
+      # failed for a configuration reason, or another run is already pending.
+      - name: Queue the next hunt
+        if: success() && steps.hunt.outputs.won != '1' && steps.hunt.outputs.next_delay != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          delay="${{ steps.hunt.outputs.next_delay }}"
+          case "$delay" in
+            ''|*[!0-9]*) echo "::error::Unexpected chain delay: '$delay'"; exit 1 ;;
+          esac
+
+          # Guard against forking the chain: if cron fires while a chain is
+          # already in flight, both would queue a successor and the run rate
+          # would double. The current run is in_progress, so exclude it.
+          pending="$(gh run list --workflow a1-hunter.yml --limit 30 \
+            --json databaseId,status \
+            | jq --arg id "$GITHUB_RUN_ID" \
+                '[.[] | select(.status != "completed" and (.databaseId | tostring) != $id)] | length')"
+          if [ "$pending" -gt 0 ]; then
+            echo "Another hunt is already running or queued; not chaining."
+            exit 0
+          fi
+
+          echo "Next hunt in ${delay}s."
+          sleep "$delay"
+          gh workflow run a1-hunter.yml --ref main
+          echo "Queued."
