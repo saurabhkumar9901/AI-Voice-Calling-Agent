@@ -1,0 +1,84 @@
+###############################################################################
+### OCI Always Free Ampere A1 — capacity hunter
+###
+### OCI's A1 free tier in ap-mumbai-1 is chronically out of capacity. There is
+### no "off-hours": windows open at random and last seconds to minutes, so this
+### polls continuously and stops as soon as it wins.
+###
+### Why GitHub Actions and not Vercel:
+###   - Vercel Hobby crons run once per day, inside a one-hour window.
+###   - Vercel Pro costs $20/mo for per-minute crons with a 300s function cap.
+###   - This repo is public, so Actions minutes are free and unconstrained.
+###
+### Required repository secrets:
+###   OCI_CLI_USER            - user OCID
+###   OCI_CLI_TENANCY         - tenancy OCID
+###   OCI_CLI_FINGERPRINT     - API key fingerprint
+###   OCI_CLI_KEY_CONTENT_B64 - API private key, base64-encoded:
+###                             base64 -w0 oci_api_key.pem
+###############################################################################
+
+name: a1-hunter
+
+on:
+  schedule:
+    # GitHub's minimum is 5 minutes and delivery is best-effort: expect jitter
+    # of up to ~15 minutes under load. The job loops internally between fires.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Probe capacity only — do not launch anything"
+        type: boolean
+        default: false
+
+# Never let two hunts overlap; a queued run is cancelled in favour of the
+# newest one, which is exactly the behaviour we want.
+concurrency:
+  group: a1-hunter
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write # success/failure reports
+  actions: write # the script disables this workflow once it wins
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    # Must finish before the next cron fire (10 min) to avoid pile-up.
+    timeout-minutes: 12
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install OCI CLI
+        run: pip install --disable-pip-version-check oci-cli
+
+      - name: Write OCI API key
+        env:
+          OCI_KEY_B64: ${{ secrets.OCI_CLI_KEY_CONTENT_B64 }}
+        run: |
+          umask 077
+          printf '%s' "$OCI_KEY_B64" | base64 -d > "$RUNNER_TEMP/oci_api_key.pem"
+          test -s "$RUNNER_TEMP/oci_api_key.pem"
+
+      - name: Hunt
+        env:
+          OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+          OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+          OCI_CLI_KEY_FILE: ${{ runner.temp }}/oci_api_key.pem
+          OCI_CLI_REGION: ap-mumbai-1
+          OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run == true && '1' || '0' }}
+        run: bash scripts/hunt-a1.sh
+
+      - name: Remove the API key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/oci_api_key.pem"

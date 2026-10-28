@@ -213,7 +213,9 @@ SUBNET=$(oci network subnet create -c "$C" --vcn-id "$VCN" --cidr-block 10.0.1.0
 Console: **Compute → Instances → Create instance**.
 
 - Image: **Oracle Linux 9** (or Ubuntu 24.04)
-- Shape: `VM.Standard.A1.Flex`, 4 OCPU, 24 GB
+- Shape: `VM.Standard.A1.Flex`, 4 OCPU, 24 GB — note that the Always Free
+  allowance is currently **2 OCPU / 12 GB** per month, so anything above that is
+  billed (see *If the launch fails* below)
 - Primary VNIC: the `dograh-public` subnet, NSG `dograh-nsg`, **public IPv4 = Yes**
   (if you used the CLI block above there is no NSG — the subnet already carries
   the equivalent `dograh-sl` security list, so nothing else is needed here)
@@ -243,6 +245,10 @@ oci compute instance launch -c "$C" --availability-domain "$AD" \
   --user-data-file guides/oci/cloud-init.sh \
   --wait-for-state RUNNING
 ```
+
+Use `{"ocpus":2,"memoryInGBs":12}` instead to stay inside the Always Free
+allowance — 4 OCPU / 24 GB is billed on a paid account and rejected on an
+Always Free one.
 
 **Reserve the public IP.** OCI ephemeral public IPs are released when the
 instance is stopped, which silently breaks DNS *and* coturn's `external-ip`.
@@ -275,9 +281,10 @@ VCN, subnet and NSG are fine and can be kept. Options, easiest first:
 2. **Ask for a smaller shape.** 1 OCPU / 6 GB or 2 OCPU / 12 GB fits more
    often. Once the instance exists, **Edit → Shape** back to 4 OCPU / 24 GB
    (needs a reboot, and only succeeds if capacity exists at that moment).
-3. **Retry automatically from Cloud Shell.** Capacity frees up periodically
-   (often late night / early morning). A failed launch creates nothing, so
-   retrying is safe:
+3. **Retry automatically.** Capacity frees up in windows of seconds to minutes,
+   at unpredictable times — there is no dependable "off-hours", and in Mumbai
+   the window is contended around the clock. A failed launch creates nothing,
+   so retrying is safe:
 
    ```bash
    export C=<compartment-ocid> T=<tenancy-ocid> SUBNET=<subnet-ocid> IMG=<aarch64-image-ocid>
@@ -301,10 +308,12 @@ VCN, subnet and NSG are fine and can be kept. Options, easiest first:
 
    Upload `cloud-init.sh` to Cloud Shell first. Cloud Shell disconnects after
    inactivity, so keep the tab active or run the loop from a PC with the OCI CLI.
+   To run it unattended instead, see *Automating the hunt* below.
+
 4. **Upgrade to Pay As You Go** (**Billing → Upgrade and Manage Payment**).
    Many users report paid accounts get A1 capacity far more easily (not
    guaranteed by Oracle). Always Free resources stay free after upgrading as
-   long as you stay within the limits (4 OCPU / 24 GB A1, 200 GB block storage).
+   long as you stay within the limits (2 OCPU / 12 GB A1, 200 GB block storage).
    Set a **budget alert** as a safety net.
 5. **Use x86 instead (paid):** `VM.Standard.E5.Flex`, 4 OCPU / 16 GB, usually
    available immediately. The Dograh images and Dockerfiles work on both
@@ -313,6 +322,65 @@ VCN, subnet and NSG are fine and can be kept. Options, easiest first:
 > Do **not** use the free `VM.Standard.E2.1.Micro` — 1 GB RAM is far too small
 > for this stack. Always Free resources only exist in your **home region**, so
 > switching regions does not help on the free tier.
+
+#### Automating the hunt (GitHub Actions)
+
+`scripts/hunt-a1.sh` does the retry loop for you from GitHub Actions, then
+disables itself once it wins. It is a **poller, not a scheduler**: it never
+destroys the instance afterwards, because getting it back is the hard part.
+
+| File | Purpose |
+|---|---|
+| `scripts/a1.env` | Non-secret target config: region, AD, shape, image, subnet, NSG, cloud-init |
+| `scripts/hunt-a1.sh` | Guard → launch → classify → notify loop |
+| `scripts/main.tf`, `variables.tf`, `outputs.tf` | Terraform source of truth **after** the instance exists |
+| `.github/workflows/a1-hunter.yml` | `*/10` schedule + manual dispatch |
+
+Why not Vercel: Hobby crons fire **once per day** inside a one-hour window, and
+per-minute crons need Pro ($20/mo) with a 300 s function cap. This repo is
+public, so Actions minutes are free and the schedule can run as often as needed.
+
+Setup:
+
+1. Create an OCI API key (**Identity → Users → your user → API keys → Add API
+   key → Paste public key**).
+   > If `private.key` at the repo root is a live OCI signing key, rotate it: it
+   > is committed to a **public** repository.
+2. Add repository secrets (Settings → Secrets and variables → Actions):
+
+   | Secret | Value |
+   |---|---|
+   | `OCI_CLI_USER` | user OCID |
+   | `OCI_CLI_TENANCY` | tenancy OCID |
+   | `OCI_CLI_FINGERPRINT` | API key fingerprint |
+   | `OCI_CLI_KEY_CONTENT_B64` | `base64 -w0 oci_api_key.pem` |
+
+3. Point `scripts/a1.env` at your image, subnet and NSG OCIDs (the defaults are
+   the Mumbai ones this guide uses).
+4. Actions → **a1-hunter** → **Run workflow** with `dry_run` ticked to verify
+   auth and the guard, then let the schedule run.
+
+The loop retries only on `OutOfHostCapacity`. Auth failures, tenancy limits and
+invalid parameters fail the run and open an issue — silently retrying a broken
+config is how this kind of automation wastes a week while looking healthy.
+
+When it wins it prints the OCID and public IP, and disables the workflow. Adopt
+it into Terraform:
+
+```bash
+cd scripts
+terraform init
+terraform import oci_core_instance.generated_oci_core_instance <instance-ocid>
+terraform plan
+```
+
+`main.tf` sets `prevent_destroy` deliberately: one `terraform destroy` costs the
+instance, and the capacity lottery starts over.
+
+> **Shape size.** The Always Free A1 allowance is currently **2 OCPU / 12 GB**
+> per month. `scripts/a1.env` asks for exactly that. Requesting 4 OCPU / 24 GB on
+> an Always Free tenancy fails on the tenancy limit before capacity is even
+> considered — and on a paid tenancy it is billed.
 
 ### A3. Host checks
 
@@ -1313,7 +1381,7 @@ TURN stays outside the LB: coturn needs UDP 3478 and the relay range
 | Compose error on `!reset` / `!override` | Docker Compose older than v2.24.4 | Upgrade the compose plugin (`docker compose version`); the port isolation in the override depends on those tags |
 | `pgsty/silo` logs "unknown command" or restarts | You changed the image to a distroless/mis-tagged build | Use a `pgsty/silo:RELEASE.*` tag; the compose command `server /data --console-address ":9001"` must stay |
 | Document upload returns 403/404 through the domain | `sub_filter` did not rewrite the MinIO URL (gzip body) or the route is missing | Keep `proxy_set_header Accept-Encoding "";` and the `/voice-audio/` location; `docker compose logs nginx` shows the request |
-| A1 launch fails: "Out of capacity for shape VM.Standard.A1.Flex in availability domain AD-1" | No free Ampere hosts in that AD right now (not a config error) | Another AD with fault domain left to Oracle; smaller shape then resize; Cloud Shell retry loop; Pay As You Go upgrade; or `VM.Standard.E5.Flex` — see **A2 → If the launch fails** |
+| A1 launch fails: "Out of capacity for shape VM.Standard.A1.Flex in availability domain AD-1" | No free Ampere hosts in that AD right now (not a config error) | Another AD with fault domain left to Oracle; smaller shape then resize; Cloud Shell retry loop or the GitHub Actions hunter; Pay As You Go upgrade; or `VM.Standard.E5.Flex` — see **A2 → If the launch fails** |
 | Public IP changed after stop/start | Ephemeral public IP | Assign a **reserved** public IP, then update DNS and `turnserver.conf` |
 | Disk full / containers restarting | 50 GB boot volume + Docker images + audio | Use 150 GB+, `docker system prune -af`, move audio to Object Storage |
 | UI loads, but API calls fail against `http://localhost:8000` | UI runtime `BACKEND_URL` is the internal `http://api:8000`; the browser cannot reach it | Set `BACKEND_URL=https://voice.example.com` for the `ui` container (browser client) and leave the compiled rewrite target at `http://api:8000` |
@@ -1361,10 +1429,10 @@ curl -sI https://willian-conditional-semistiffly.ngrok-free.dev | head -1
 
 ## 5. Cost sketch
 
-- **Always Free path (Path A):** `VM.Standard.A1.Flex` 4 OCPU / 24 GB, up to
-  200 GB block volume, 10 TB/month outbound — enough for a small single-tenant
-  deployment at effectively zero compute cost. A1 capacity is best-effort in the
-  home region.
+- **Always Free path (Path A):** `VM.Standard.A1.Flex` 2 OCPU / 12 GB (the
+  current Always Free allowance), up to 200 GB block volume, 10 TB/month
+  outbound — enough for a small single-tenant deployment at effectively zero
+  compute cost. A1 capacity is best-effort in the home region.
 - **Paid Path A:** one flex VM + 150 GB boot volume + backups + egress. Cheapest
   production option.
 - **Path B:** OKE basic control plane is free; you pay for worker nodes, the
@@ -1408,6 +1476,10 @@ curl -sI https://willian-conditional-semistiffly.ngrok-free.dev | head -1
 | File | Purpose |
 |---|---|
 | [`guides/oci/cloud-init.sh`](oci/cloud-init.sh) | First-boot host prep (Docker, swap, firewall) |
+| [`scripts/hunt-a1.sh`](../scripts/hunt-a1.sh) | A1 capacity hunter: retry loop, error classification, self-disable on success |
+| [`scripts/a1.env`](../scripts/a1.env) | Non-secret target config for the hunter |
+| [`scripts/main.tf`](../scripts/main.tf) | Terraform source of truth after the instance exists (`prevent_destroy`) |
+| [`.github/workflows/a1-hunter.yml`](../.github/workflows/a1-hunter.yml) | `*/10` schedule + manual `dry_run` dispatch |
 | [`guides/oci/docker-compose.oci.yaml`](oci/docker-compose.oci.yaml) | Variant 2: restart policies, log caps, credentials from `.env`, closes 5432/6379, binds 8000/3010 to loopback, swaps the object-storage image to SILO, makes `cloudflared` opt-in |
 | [`guides/oci/nginx.conf.template`](oci/nginx.conf.template) | Variant 2: domain-based TLS reverse proxy with ACME webroot + `/voice-audio/` |
 | [`guides/oci/dograh.service`](oci/dograh.service) | Variant 2: systemd unit so the stack survives reboots |
