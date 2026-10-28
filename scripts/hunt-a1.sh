@@ -148,7 +148,9 @@ probe_capacity() {
     return 0
   fi
 
-  printf 'UNKNOWN (%s)' "$(printf '%s' "$output" | head -n 1 | cut -c1-140)"
+  printf 'UNKNOWN (%s)' "$(printf '%s' "$output" \
+    | sed -e 's/\x1b\[[0-9;]*m//g' \
+    | tr '\n' ' ' | tr -s ' ' | cut -c1-220)"
 }
 
 launch_instance() {
