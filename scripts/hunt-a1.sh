@@ -26,9 +26,13 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/a1.env"
 
-MAX_ATTEMPTS="${MAX_ATTEMPTS:-5}"
-RETRY_SECONDS="${RETRY_SECONDS:-60}"
-JITTER_SECONDS="${JITTER_SECONDS:-30}"
+# With --no-retry a capacity rejection costs ~3s instead of ~110s, so the
+# cadence here is set by OCI's per-user rate limit rather than by latency.
+# 4 attempts ~2 minutes apart keeps a run under the 10-minute cron interval
+# while staying well clear of the 429 threshold.
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-4}"
+RETRY_SECONDS="${RETRY_SECONDS:-100}"
+JITTER_SECONDS="${JITTER_SECONDS:-40}"
 DRY_RUN="${DRY_RUN:-0}"
 
 RED=$'\033[0;31m'
@@ -103,12 +107,20 @@ disable_self() {
 #
 # The guard is also what makes repeated runs idempotent: a launch that succeeds
 # while the CLI times out would otherwise create a second instance.
+# --- Why every call below passes --no-retry -------------------------------
+# "Out of host capacity" comes back as HTTP 500, which the OCI Python SDK
+# treats as retryable. Left alone it silently re-sends the request for up to
+# ~110 seconds before surfacing an error that was already final on the first
+# attempt. That burns the whole retry budget, multiplies the request count
+# against OCI's per-user rate limit (which then answers 429 and ends the run),
+# and delays our own retry cadence by two minutes every time. --no-retry makes
+# a capacity rejection return immediately: no capacity means no capacity.
 existing_instance() {
   local id
   # Do NOT swallow errors here. A failed list call means we cannot tell whether
   # an instance exists, and treating that as "none exists" is how a broken
   # credential quietly turns into a running hunt that can never succeed.
-  id="$(oci compute instance list \
+  id="$(oci --no-retry compute instance list \
     --compartment-id "$COMPARTMENT_ID" \
     --all \
     --query "data[?\"shape\"=='VM.Standard.A1.Flex' && \"display-name\"=='${DISPLAY_NAME}' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'] | [0].id" \
@@ -119,12 +131,12 @@ existing_instance() {
 }
 
 instance_state() {
-  oci compute instance get --instance-id "$1" \
+  oci --no-retry compute instance get --instance-id "$1" \
     --query 'data."lifecycle-state"' --raw-output 2>/dev/null || echo "UNKNOWN"
 }
 
 public_ip_of() {
-  oci compute instance list-vnics --instance-id "$1" \
+  oci --no-retry compute instance list-vnics --instance-id "$1" \
     --query 'data[0]."public-ip"' --raw-output 2>/dev/null || echo "unknown"
 }
 
@@ -137,7 +149,7 @@ public_ip_of() {
 # or the shape is not reportable in that region, and that is worth seeing.
 probe_capacity() {
   local output
-  if output="$(oci compute compute-capacity-report create \
+  if output="$(oci --no-retry compute compute-capacity-report create \
       --compartment-id "$COMPARTMENT_ID" \
       --availability-domain "$AVAILABILITY_DOMAIN" \
       --shape-availabilities "[{\"instanceShape\":\"VM.Standard.A1.Flex\",\"instanceShapeConfig\":{\"ocpus\":${OCPUS},\"memoryInGBs\":${MEMORY_GBS}}}]" \
@@ -174,7 +186,7 @@ launch_instance() {
     fi
   fi
 
-  oci compute instance launch \
+  oci --no-retry compute instance launch \
     --availability-domain "$AVAILABILITY_DOMAIN" \
     --compartment-id "$COMPARTMENT_ID" \
     --shape "VM.Standard.A1.Flex" \
