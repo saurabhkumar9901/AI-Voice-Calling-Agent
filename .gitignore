@@ -4,6 +4,17 @@ __pycache__
 .env.prod
 .env.test
 
+# OCI / Terraform — never commit Terraform state or API keys
+private.key
+*.pem
+*.key
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
+override.tf
+
 # logs and run directory on production
 /logs/
 /run/
