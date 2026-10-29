@@ -1219,6 +1219,7 @@ export type TurnCredentialsResponse = {
     password: string;
     ttl: number;
     uris: Array<string>;
+    force_relay?: boolean;
 };
 
 /**

@@ -139,6 +139,9 @@ TURN_HOST = os.getenv("TURN_HOST", "localhost")
 TURN_PORT = int(os.getenv("TURN_PORT", "3478"))
 TURN_TLS_PORT = int(os.getenv("TURN_TLS_PORT", "5349"))
 TURN_CREDENTIAL_TTL = int(os.getenv("TURN_CREDENTIAL_TTL", "86400"))
+# Force browsers to send media only via the TURN relay (iceTransportPolicy="relay").
+# Useful when the API runs behind Docker bridge NAT + cloud NAT and direct paths are unstable.
+TURN_FORCE_RELAY = os.getenv("TURN_FORCE_RELAY", "false").lower() == "true"
 
 # OSS Email/Password Auth
 OSS_JWT_SECRET = os.getenv("OSS_JWT_SECRET", "change-me-in-production")

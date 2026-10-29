@@ -26,6 +26,7 @@ from pydantic import BaseModel
 from api.constants import (
     ENVIRONMENT,
     TURN_CREDENTIAL_TTL,
+    TURN_FORCE_RELAY,
     TURN_HOST,
     TURN_PORT,
     TURN_SECRET,
@@ -45,6 +46,8 @@ class TurnCredentialsResponse(BaseModel):
     password: str
     ttl: int
     uris: List[str]
+    # When true, clients should set iceTransportPolicy="relay" (TURN only)
+    force_relay: bool = False
 
 
 class TurnConfigResponse(BaseModel):
@@ -127,6 +130,7 @@ def generate_turn_credentials(user_id: str, ttl: int = TURN_CREDENTIAL_TTL) -> d
         "password": password,
         "ttl": ttl,
         "uris": uris,
+        "force_relay": TURN_FORCE_RELAY,
     }
 
 

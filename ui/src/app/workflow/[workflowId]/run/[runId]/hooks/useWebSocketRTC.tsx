@@ -126,6 +126,12 @@ export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initia
             iceServers
         };
 
+        // Backend can force TURN-only media (e.g. API behind Docker + cloud NAT)
+        if (turnCredentials?.force_relay && turnCredentials.uris?.length) {
+            config.iceTransportPolicy = 'relay';
+            logger.info('ICE transport policy: relay (TURN only)');
+        }
+
         const pc = new RTCPeerConnection(config);
 
         // Set up ICE candidate trickling

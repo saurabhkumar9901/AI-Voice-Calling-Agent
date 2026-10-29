@@ -30,6 +30,9 @@ x-public-env: &public-env
   TURN_SECRET: ${TURN_SECRET:?Set TURN_SECRET in the root .env}
   TURN_PORT: "3478"
   TURN_TLS_PORT: "0"
+  # Browser media goes only via coturn (host network -> reaches the API
+  # container directly), avoiding the fragile Docker NAT + OCI NAT direct path.
+  TURN_FORCE_RELAY: "true"
 
 services:
   postgres:
