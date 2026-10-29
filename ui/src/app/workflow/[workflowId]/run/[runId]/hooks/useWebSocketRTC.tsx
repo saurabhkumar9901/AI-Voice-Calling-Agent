@@ -70,6 +70,9 @@ export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initia
     const pcRef = useRef<RTCPeerConnection | null>(null);
     const wsRef = useRef<WebSocket | null>(null);
     const timeStartRef = useRef<number | null>(null);
+    // Timer used to give a transient ICE 'disconnected' state time to recover
+    const iceDisconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const ICE_DISCONNECT_GRACE_MS = 5000;
 
     // Generate a cryptographically secure unique ID
     const generateSecureId = () => {
@@ -149,41 +152,65 @@ export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initia
             }
         });
 
+        const clearIceDisconnectTimer = () => {
+            if (iceDisconnectTimerRef.current) {
+                clearTimeout(iceDisconnectTimerRef.current);
+                iceDisconnectTimerRef.current = null;
+            }
+        };
+
+        const endCallFromIceState = () => {
+            clearIceDisconnectTimer();
+            logger.info('Peer connection lost - cleaning up connection');
+
+            // Close WebSocket if still open
+            if (wsRef.current) {
+                wsRef.current.close();
+                wsRef.current = null;
+            }
+
+            // Mark as completed to trigger recording check
+            setConnectionActive(false);
+            setIsCompleted(true);
+            setConnectionStatus('idle');
+
+            // Clean up peer connection
+            if (pc.getTransceivers) {
+                pc.getTransceivers().forEach((transceiver) => {
+                    if (transceiver.stop) {
+                        transceiver.stop();
+                    }
+                });
+            }
+
+            pc.getSenders().forEach((sender) => {
+                if (sender.track) {
+                    sender.track.stop();
+                }
+            });
+        };
+
         pc.addEventListener('iceconnectionstatechange', () => {
             logger.info(`ICE connection state changed: ${pc.iceConnectionState}`);
             if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+                // Recovered (or first connect) - cancel any pending teardown
+                clearIceDisconnectTimer();
                 setConnectionStatus('connected');
-            } else if (pc.iceConnectionState === 'failed') {
-                setConnectionStatus('failed');
+            } else if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') {
+                endCallFromIceState();
             } else if (pc.iceConnectionState === 'disconnected') {
-                // Server-initiated disconnect - clean up gracefully
-                logger.info('Server initiated disconnect - cleaning up connection');
-
-                // Close WebSocket if still open
-                if (wsRef.current) {
-                    wsRef.current.close();
-                    wsRef.current = null;
-                }
-
-                // Mark as completed to trigger recording check
-                setConnectionActive(false);
-                setIsCompleted(true);
-                setConnectionStatus('idle');
-
-                // Clean up peer connection
-                if (pc.getTransceivers) {
-                    pc.getTransceivers().forEach((transceiver) => {
-                        if (transceiver.stop) {
-                            transceiver.stop();
+                // 'disconnected' is transient: browsers enter it after a few seconds of
+                // missed connectivity checks and frequently recover on their own (NAT
+                // rebinding, brief packet loss). Only end the call if it does not recover.
+                if (!iceDisconnectTimerRef.current) {
+                    logger.warn(`ICE disconnected - waiting ${ICE_DISCONNECT_GRACE_MS}ms for recovery`);
+                    iceDisconnectTimerRef.current = setTimeout(() => {
+                        iceDisconnectTimerRef.current = null;
+                        if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
+                            endCallFromIceState();
                         }
-                    });
+                    }, ICE_DISCONNECT_GRACE_MS);
                 }
-
-                pc.getSenders().forEach((sender) => {
-                    if (sender.track) {
-                        sender.track.stop();
-                    }
-                });
             }
         });
 
@@ -641,6 +668,10 @@ export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initia
     };
 
     const stop = () => {
+        if (iceDisconnectTimerRef.current) {
+            clearTimeout(iceDisconnectTimerRef.current);
+            iceDisconnectTimerRef.current = null;
+        }
         setConnectionActive(false);
         setIsCompleted(true);
         setConnectionStatus('idle');
@@ -680,6 +711,9 @@ export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initia
     // Cleanup on unmount
     useEffect(() => {
         return () => {
+            if (iceDisconnectTimerRef.current) {
+                clearTimeout(iceDisconnectTimerRef.current);
+            }
             if (wsRef.current) {
                 wsRef.current.close();
             }
