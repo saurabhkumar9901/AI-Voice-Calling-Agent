@@ -79,8 +79,7 @@ class CSVSyncService(CampaignSourceSyncService):
             logger.warning(f"No data found in CSV for campaign {campaign_id}")
             return 0
 
-        headers = self.normalize_headers(csv_data[0])
-        rows = csv_data[1:]
+        headers, rows = self.sanitize_source_rows(csv_data[0], csv_data[1:])
 
         # Create hash of file_key for consistent source_uuid prefix
         file_hash = hashlib.md5(file_key.encode()).hexdigest()[:8]
@@ -93,11 +92,6 @@ class CSVSyncService(CampaignSourceSyncService):
 
             # Create context variables dict
             context_vars = dict(zip(headers, padded_row))
-
-            # Skip if no phone number
-            if not context_vars.get("phone_number"):
-                logger.debug(f"Skipping row {idx}: no phone_number")
-                continue
 
             # Generate unique source UUID: csv_{hash(source_id)}_row_{idx}
             source_uuid = f"csv_{file_hash}_row_{idx}"

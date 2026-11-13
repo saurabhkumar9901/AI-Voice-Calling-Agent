@@ -1,8 +1,12 @@
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
 from loguru import logger
+
+# Dialing code applied to phone numbers that do not carry one.
+DEFAULT_DIALING_CODE = "91"
 
 
 @dataclass
@@ -32,11 +36,86 @@ class CampaignSourceSyncService(ABC):
         return [h.strip().lower() for h in headers]
 
     @staticmethod
+    def normalize_phone_number(value: str) -> str:
+        """Normalize a phone number to E.164, defaulting to +91.
+
+        Users often paste numbers without a country code, with a trunk prefix
+        (leading 0), or with spaces/dashes/parentheses. Returns "" when the
+        value cannot be turned into a dialable number so the caller can drop it.
+        """
+        cleaned = (value or "").strip().lstrip("'").strip()
+        if not cleaned or not re.fullmatch(r"\+?[\d\s\-().]+", cleaned):
+            return ""
+
+        digits = re.sub(r"\D", "", cleaned)
+        if not digits:
+            return ""
+
+        # Numbers that already carry a country code keep it as-is.
+        if cleaned.startswith("+"):
+            return f"+{digits}" if len(digits) <= 15 else ""
+
+        digits = digits.lstrip("0")
+        if not digits:
+            return ""
+        # At most 10 digits means no country code was supplied.
+        if len(digits) <= 10:
+            return f"+{DEFAULT_DIALING_CODE}{digits}"
+        return f"+{digits}" if len(digits) <= 15 else ""
+
+    @classmethod
+    def sanitize_source_rows(
+        cls, headers: List[str], rows: List[List[str]]
+    ) -> tuple[List[str], List[List[str]]]:
+        """Clean source rows so a campaign can start without manual edits.
+
+        - Adds the country code to phone numbers that lack one.
+        - Drops rows whose phone number is empty or unusable.
+        - Drops duplicate phone numbers, keeping the first occurrence.
+        """
+        normalized_headers = cls.normalize_headers(headers)
+        if "phone_number" not in normalized_headers:
+            return normalized_headers, rows
+
+        phone_idx = normalized_headers.index("phone_number")
+        seen_phones: Set[str] = set()
+        sanitized_rows: List[List[str]] = []
+        dropped_empty = 0
+        dropped_duplicate = 0
+
+        for row in rows:
+            padded_row = list(row) + [""] * (len(normalized_headers) - len(row))
+            phone_number = cls.normalize_phone_number(padded_row[phone_idx])
+
+            if not phone_number:
+                dropped_empty += 1
+                continue
+            if phone_number in seen_phones:
+                dropped_duplicate += 1
+                continue
+
+            seen_phones.add(phone_number)
+            padded_row[phone_idx] = phone_number
+            sanitized_rows.append(padded_row)
+
+        if dropped_empty or dropped_duplicate:
+            logger.info(
+                f"Cleaned source data: dropped {dropped_empty} rows without a "
+                f"usable phone number and {dropped_duplicate} duplicate rows; "
+                f"{len(sanitized_rows)} rows remain"
+            )
+
+        return normalized_headers, sanitized_rows
+
+    @classmethod
     def validate_source_data(
-        headers: List[str], rows: List[List[str]]
+        cls, headers: List[str], rows: List[List[str]]
     ) -> ValidationResult:
         """
         Validate source data for campaign creation.
+
+        Phone numbers are normalized in place (country code added, duplicates
+        and empty numbers removed) so the returned rows are ready to sync.
 
         Args:
             headers: List of column headers
@@ -45,7 +124,7 @@ class CampaignSourceSyncService(ABC):
         Returns:
             ValidationResult with is_valid=True if valid, or error details if invalid
         """
-        normalized_headers = CampaignSourceSyncService.normalize_headers(headers)
+        normalized_headers = cls.normalize_headers(headers)
 
         # Check for phone_number column
         if "phone_number" not in normalized_headers:
@@ -56,66 +135,20 @@ class CampaignSourceSyncService(ABC):
                 ),
             )
 
-        phone_number_idx = normalized_headers.index("phone_number")
+        normalized_headers, sanitized_rows = cls.sanitize_source_rows(headers, rows)
 
-        # Validate phone numbers in all data rows
-        invalid_rows = []
-        for row_idx, row in enumerate(
-            rows, start=2
-        ):  # Start at 2 (1-indexed, skip header)
-            if len(row) <= phone_number_idx:
-                continue  # Skip rows that don't have enough columns
-
-            phone_number = row[phone_number_idx].strip()
-            if phone_number and not phone_number.startswith("+"):
-                invalid_rows.append(row_idx)
-
-        if invalid_rows:
-            # Limit the number of rows shown in error message
-            if len(invalid_rows) > 5:
-                rows_str = f"{', '.join(map(str, invalid_rows[:5]))} and {len(invalid_rows) - 5} more"
-            else:
-                rows_str = ", ".join(map(str, invalid_rows))
-
+        if rows and not sanitized_rows:
             return ValidationResult(
                 is_valid=False,
                 error=ValidationError(
-                    message=f"Invalid phone numbers in rows: {rows_str}. All phone numbers must include country code (start with '+')",
-                    invalid_rows=invalid_rows,
+                    message="No valid phone numbers found. Every row is either "
+                    "missing a phone number or duplicates another row."
                 ),
             )
 
-        # Check for duplicate phone numbers
-        seen_phones: dict[str, int] = {}  # phone -> first row where it appeared
-        duplicate_rows = []
-        for row_idx, row in enumerate(rows, start=2):
-            if len(row) <= phone_number_idx:
-                continue
-
-            phone_number = row[phone_number_idx].strip()
-            if not phone_number:
-                continue
-
-            if phone_number in seen_phones:
-                duplicate_rows.append(row_idx)
-            else:
-                seen_phones[phone_number] = row_idx
-
-        if duplicate_rows:
-            if len(duplicate_rows) > 5:
-                rows_str = f"{', '.join(map(str, duplicate_rows[:5]))} and {len(duplicate_rows) - 5} more"
-            else:
-                rows_str = ", ".join(map(str, duplicate_rows))
-
-            return ValidationResult(
-                is_valid=False,
-                error=ValidationError(
-                    message=f"Duplicate phone numbers found in rows: {rows_str}. Phone numbers in a campaign must be unique.",
-                    invalid_rows=duplicate_rows,
-                ),
-            )
-
-        return ValidationResult(is_valid=True, headers=normalized_headers, rows=rows)
+        return ValidationResult(
+            is_valid=True, headers=normalized_headers, rows=sanitized_rows
+        )
 
     @staticmethod
     def validate_template_columns(

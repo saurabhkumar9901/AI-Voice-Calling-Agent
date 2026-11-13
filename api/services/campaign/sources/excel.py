@@ -1,5 +1,4 @@
 import hashlib
-import re
 from datetime import date, datetime
 from io import BytesIO
 from typing import List, Optional
@@ -32,21 +31,6 @@ def _cell_to_str(value) -> str:
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value).strip()
-
-
-def _normalize_phone_number(value: str) -> str:
-    """Normalize a phone number from an Excel cell to E.164 with + prefix.
-
-    Excel treats a leading "+" as a formula, so users type numbers without it
-    (and often with spaces/dashes). Strip common formatting and prepend "+"
-    when the remaining digits look like an international number (7-15 digits).
-    Anything else is returned stripped but untouched so downstream validation
-    flags the exact row instead of silently corrupting it.
-    """
-    cleaned = re.sub(r"[\s\-().]", "", (value or "").strip())
-    if re.fullmatch(r"\+?\d{7,15}", cleaned):
-        return cleaned if cleaned.startswith("+") else f"+{cleaned}"
-    return (value or "").strip()
 
 
 class ExcelSyncService(CampaignSourceSyncService):
@@ -173,9 +157,11 @@ class ExcelSyncService(CampaignSourceSyncService):
             mapped_rows.append(
                 [
                     padded[resolved["name_col"]].strip(),
-                    # Excel mangles leading "+" (formula parsing), so users type
-                    # numbers without it — normalize to E.164 here.
-                    _normalize_phone_number(padded[resolved["phone_col"]]),
+                    # Excel mangles leading "+" (formula parsing), so normalize
+                    # to E.164 (adding the default country code) here.
+                    CampaignSourceSyncService.normalize_phone_number(
+                        padded[resolved["phone_col"]]
+                    ),
                     padded[resolved["city_col"]].strip(),
                 ]
                 + [padded[i].strip() for i in extra_indices]
@@ -217,7 +203,10 @@ class ExcelSyncService(CampaignSourceSyncService):
 
         excel_data = await self._fetch_excel_data(source_id)
         headers = [h if h else f"Column {i + 1}" for i, h in enumerate(excel_data[0])]
-        return self.apply_mapping(headers, excel_data[1:], mapping)
+        mapped_headers, mapped_rows = self.apply_mapping(
+            headers, excel_data[1:], mapping
+        )
+        return self.sanitize_source_rows(mapped_headers, mapped_rows)
 
     async def validate_mapped_source(
         self, source_id: str, mapping: dict
@@ -270,12 +259,13 @@ class ExcelSyncService(CampaignSourceSyncService):
         headers = [h if h else f"Column {i + 1}" for i, h in enumerate(excel_data[0])]
         mapped_headers, mapped_rows = self.apply_mapping(headers, excel_data[1:], mapping)
 
-        # Reuse phone-format and duplicate validation on the mapped data.
+        # Normalize phone numbers and drop empty/duplicate contacts.
         validation = self.validate_source_data(mapped_headers, mapped_rows)
         if not validation.is_valid:
             raise ValueError(
                 f"Excel data failed validation: {validation.error.message}"
             )
+        mapped_headers, mapped_rows = validation.headers, validation.rows
 
         file_hash = hashlib.md5(file_key.encode()).hexdigest()[:8]
 
@@ -283,10 +273,6 @@ class ExcelSyncService(CampaignSourceSyncService):
         for idx, row_values in enumerate(mapped_rows, 1):
             padded_row = row_values + [""] * (len(mapped_headers) - len(row_values))
             context_vars = dict(zip(mapped_headers, padded_row))
-
-            if not context_vars.get("phone_number"):
-                logger.debug(f"Skipping row {idx}: no phone_number")
-                continue
 
             queued_runs.append(
                 {

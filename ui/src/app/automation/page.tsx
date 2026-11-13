@@ -482,7 +482,7 @@ export default function AutomationPage() {
                         <CardTitle>2. Upload your Excel sheet</CardTitle>
                         <CardDescription>
                             .xlsx or .xls with a header row. Must contain names, phone numbers, and cities. Max 10MB.
-                            Tip: type phone numbers without the leading + (Excel treats + as a formula) — with country code, e.g. 918071579893. Spaces and dashes are fine.
+                            Tip: numbers without a country code are treated as +91 and the + prefix is added automatically. Spaces and dashes are fine. Rows with a missing or duplicate phone number are skipped.
                         </CardDescription>
                     </CardHeader>
                     <CardContent className="space-y-4">
@@ -527,7 +527,7 @@ export default function AutomationPage() {
                     <CardHeader>
                         <CardTitle>3. Map your columns</CardTitle>
                         <CardDescription>
-                            Tell us which column holds each detail. The + prefix is added automatically — just map the digits.
+                            Tell us which column holds each detail. Phone numbers are normalized to +91 when no country code is provided — just map the digits.
                         </CardDescription>
                     </CardHeader>
                     <CardContent className="space-y-4">

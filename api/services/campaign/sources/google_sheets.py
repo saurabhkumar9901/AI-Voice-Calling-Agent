@@ -128,8 +128,7 @@ class GoogleSheetsSyncService(CampaignSourceSyncService):
             logger.warning(f"No data found in sheet for campaign {campaign_id}")
             return 0
 
-        headers = self.normalize_headers(rows[0])
-        data_rows = rows[1:]
+        headers, data_rows = self.sanitize_source_rows(rows[0], rows[1:])
 
         sheet_id = self._extract_sheet_id(campaign.source_id)
 
@@ -140,11 +139,6 @@ class GoogleSheetsSyncService(CampaignSourceSyncService):
 
             # Create context variables dict
             context_vars = dict(zip(headers, padded_row))
-
-            # Skip if no phone number
-            if not context_vars.get("phone_number"):
-                logger.debug(f"Skipping row {idx}: no phone_number")
-                continue
 
             # Generate unique source UUID
             source_uuid = f"sheet_{sheet_id}_row_{idx}"
