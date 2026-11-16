@@ -1,6 +1,5 @@
 """ARQ worker configuration - setup logging before importing tasks"""
 
-import asyncio
 import ssl
 from urllib.parse import urlparse
 
@@ -62,9 +61,9 @@ async def preload_sentiment_model(ctx):
     this module to enqueue jobs.
     """
     try:
-        from api.services.call_insights import warm_sentiment_model
+        from api.services.call_insights import warm_sentiment_model_async
 
-        await asyncio.to_thread(warm_sentiment_model)
+        await warm_sentiment_model_async()
     except Exception as e:
         logger.warning(f"Failed to preload sentiment model: {e}")
 

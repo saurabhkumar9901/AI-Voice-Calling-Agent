@@ -10,6 +10,7 @@ import asyncio
 import json
 import random
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from loguru import logger
 
@@ -45,7 +46,19 @@ SENTIMENT_DISPLAY = {
 SENTIMENT_MIN_SCORE = 0.4
 SENTIMENT_MAX_CHARS = 4000
 
+# The local model is CPU-heavy. Run it on exactly one dedicated thread so that
+# concurrent completion jobs cannot oversubscribe the container, and so the
+# loop's default executor (DNS lookups, MinIO/S3 blocking calls) stays free.
+# Sharing that executor with the model used to starve unrelated I/O: source
+# syncs failed with MinIO connect timeouts while insights were running.
+_SENTIMENT_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="sentiment"
+)
+SENTIMENT_TIMEOUT_SECONDS = 120.0
+EXTRACTION_TIMEOUT_SECONDS = 60.0
+
 _sentiment_pipeline = None
+_sentiment_load_failed = False
 _sentiment_lock = threading.Lock()
 
 
@@ -117,22 +130,42 @@ async def extract_callback_and_actions(
 
 
 def _load_sentiment_pipeline():
-    """Lazy singleton (first call downloads/loads ~1GB, then cached)."""
-    global _sentiment_pipeline
-    if _sentiment_pipeline is not None:
+    """Lazy singleton (first call downloads/loads ~1GB, then cached).
+
+    A failed load is remembered: retrying the (often network-bound) download on
+    every transcript would block the worker for minutes per call.
+    """
+    global _sentiment_pipeline, _sentiment_load_failed
+    if _sentiment_pipeline is not None or _sentiment_load_failed:
         return _sentiment_pipeline
     with _sentiment_lock:
-        if _sentiment_pipeline is not None:
+        if _sentiment_pipeline is not None or _sentiment_load_failed:
             return _sentiment_pipeline
-        from transformers import pipeline
+        try:
+            from transformers import pipeline
 
-        logger.info(f"Loading local sentiment model {SENTIMENT_MODEL_ID} ...")
-        _sentiment_pipeline = pipeline(
-            "zero-shot-classification",
-            model=SENTIMENT_MODEL_ID,
-            device=-1,  # CPU
-        )
-        logger.info("Local sentiment model loaded")
+            try:
+                import torch
+
+                # Inference is serialized on one thread, so more intra-op
+                # threads only cause contention with the event loop.
+                torch.set_num_threads(1)
+            except Exception as e:
+                logger.debug(f"Could not limit torch threads: {e}")
+
+            logger.info(f"Loading local sentiment model {SENTIMENT_MODEL_ID} ...")
+            _sentiment_pipeline = pipeline(
+                "zero-shot-classification",
+                model=SENTIMENT_MODEL_ID,
+                device=-1,  # CPU
+            )
+            logger.info("Local sentiment model loaded")
+        except Exception as e:
+            _sentiment_load_failed = True
+            logger.error(
+                f"Could not load local sentiment model {SENTIMENT_MODEL_ID}: {e}. "
+                "Sentiment will be skipped until the worker restarts."
+            )
         return _sentiment_pipeline
 
 
@@ -142,10 +175,13 @@ def warm_sentiment_model() -> None:
     Loading takes ~2 minutes on CPU; warming it from the worker's startup hook
     keeps that cost out of the workflow-completion job's timeout.
     """
-    try:
-        _load_sentiment_pipeline()
-    except Exception as e:
-        logger.warning(f"Could not preload local sentiment model: {e}")
+    _load_sentiment_pipeline()
+
+
+async def warm_sentiment_model_async() -> None:
+    """Warm the model on its own thread instead of the loop's default executor."""
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(_SENTIMENT_EXECUTOR, warm_sentiment_model)
 
 
 def classify_sentiment(transcript_text: str) -> str | None:
@@ -153,8 +189,10 @@ def classify_sentiment(transcript_text: str) -> str | None:
     text = _truncate(transcript_text, SENTIMENT_MAX_CHARS)
     if len(text) < MIN_TRANSCRIPT_CHARS:
         return None
+    classifier = _load_sentiment_pipeline()
+    if classifier is None:
+        return None
     try:
-        classifier = _load_sentiment_pipeline()
         result = classifier(
             text,
             candidate_labels=SENTIMENT_LABELS,
@@ -174,19 +212,45 @@ def classify_sentiment(transcript_text: str) -> str | None:
         return None
 
 
+async def classify_sentiment_async(transcript_text: str) -> str | None:
+    """Classify sentiment without letting the caller hang on the local model.
+
+    Runs on the dedicated single-thread executor (never the loop's default one)
+    and gives up after ``SENTIMENT_TIMEOUT_SECONDS`` so a pathological
+    transcript cannot consume the whole completion job.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(
+                _SENTIMENT_EXECUTOR, classify_sentiment, transcript_text
+            ),
+            timeout=SENTIMENT_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"Local sentiment classification exceeded "
+            f"{SENTIMENT_TIMEOUT_SECONDS:.0f}s; skipping sentiment for this call"
+        )
+        return None
+    except Exception as e:
+        logger.warning(f"Local sentiment classification failed: {e}")
+        return None
+
+
 async def generate_call_insights(
     workflow_run, transcript_text: str, call_time_iso: str, user_tz: str
 ) -> dict:
     """Run extraction (LLM) + sentiment (local NLP). Never raises."""
-    loop = asyncio.get_running_loop()
-    extraction_task = asyncio.create_task(
-        extract_callback_and_actions(
-            workflow_run, transcript_text, call_time_iso, user_tz
-        )
-    )
-    sentiment_task = loop.run_in_executor(None, classify_sentiment, transcript_text)
     extraction, sentiment = await asyncio.gather(
-        extraction_task, sentiment_task, return_exceptions=True
+        asyncio.wait_for(
+            extract_callback_and_actions(
+                workflow_run, transcript_text, call_time_iso, user_tz
+            ),
+            timeout=EXTRACTION_TIMEOUT_SECONDS,
+        ),
+        classify_sentiment_async(transcript_text),
+        return_exceptions=True,
     )
     if isinstance(extraction, Exception):
         logger.warning(f"Insight extraction errored: {extraction}")

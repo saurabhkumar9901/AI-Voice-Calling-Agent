@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 from datetime import datetime, timezone
@@ -18,6 +19,11 @@ from api.services.pricing.workflow_run_cost import calculate_workflow_run_cost
 from api.services.storage import get_current_storage_backend, storage_fs
 from api.tasks.run_integrations import run_integrations_post_workflow_run
 from pipecat.utils.run_context import set_current_run_id
+
+# Hard ceiling for post-call insights. The local sentiment model and the LLM
+# extraction each have their own budgets; this keeps a slow analysis from
+# eating the whole completion job and delaying integrations/cost calculation.
+INSIGHTS_TIMEOUT_SECONDS = 180.0
 
 
 def _transcript_needs_regeneration(transcript_text: Optional[str]) -> bool:
@@ -313,8 +319,11 @@ async def process_workflow_completion(
                     if insight_run.created_at
                     else datetime.now(timezone.utc).isoformat()
                 )
-                insights = await generate_call_insights(
-                    insight_run, transcript_text, call_time_iso, user_tz
+                insights = await asyncio.wait_for(
+                    generate_call_insights(
+                        insight_run, transcript_text, call_time_iso, user_tz
+                    ),
+                    timeout=INSIGHTS_TIMEOUT_SECONDS,
                 )
 
                 actions = insights.get("action_items") or []

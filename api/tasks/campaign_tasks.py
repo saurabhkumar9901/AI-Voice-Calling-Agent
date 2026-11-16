@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 UTC = timezone.utc
 from typing import Dict
 
+from arq.worker import Retry
 from loguru import logger
 
 from api.db import db_client
@@ -9,8 +10,17 @@ from api.services.campaign.campaign_call_dispatcher import campaign_call_dispatc
 from api.services.campaign.campaign_event_publisher import (
     get_campaign_event_publisher,
 )
-from api.services.campaign.errors import ConcurrentSlotAcquisitionError
+from api.services.campaign.errors import (
+    ConcurrentSlotAcquisitionError,
+    PhoneNumberPoolExhaustedError,
+)
 from api.services.campaign.source_sync_factory import get_sync_service
+from api.services.campaign.sources.download import SourceFetchError
+
+# Storage outages (MinIO restart, network blip) are transient: retry the sync
+# job before failing the campaign and forcing the user to recreate it.
+SOURCE_SYNC_MAX_ATTEMPTS = 3
+SOURCE_SYNC_RETRY_DELAY_SECONDS = 15
 
 
 async def sync_campaign_source(ctx: Dict, campaign_id: int) -> None:
@@ -72,6 +82,17 @@ async def sync_campaign_source(ctx: Dict, campaign_id: int) -> None:
         )
 
     except Exception as e:
+        job_try = int((ctx or {}).get("job_try", 1))
+        if isinstance(e, SourceFetchError) and job_try < SOURCE_SYNC_MAX_ATTEMPTS:
+            # Keep the campaign in 'syncing' and let ARQ retry: storage blips
+            # must not turn into a terminal 'failed' campaign.
+            logger.warning(
+                f"Transient error syncing campaign {campaign_id} source "
+                f"(attempt {job_try}/{SOURCE_SYNC_MAX_ATTEMPTS}), retrying in "
+                f"{SOURCE_SYNC_RETRY_DELAY_SECONDS}s: {e}"
+            )
+            raise Retry(defer=SOURCE_SYNC_RETRY_DELAY_SECONDS)
+
         logger.error(f"Error syncing campaign {campaign_id} source: {e}")
 
         # Update campaign with error
@@ -123,22 +144,22 @@ async def process_campaign_batch(
             f"failed={failed_count}"
         )
 
-    except ConcurrentSlotAcquisitionError as e:
+    except (ConcurrentSlotAcquisitionError, PhoneNumberPoolExhaustedError) as e:
+        # The dispatcher normally absorbs these as a soft stop (unsent runs go
+        # back to 'queued'). If one still escapes, treat it the same way: the
+        # campaign keeps running and the orchestrator retries the batch.
         logger.warning(
-            f"Failed to acquire concurrent slot for campaign {campaign_id}: {e}"
+            f"Campaign {campaign_id} is at call capacity ({e}); "
+            "leaving the batch to be retried"
         )
 
-        # Publish batch failed event with specific error
         publisher = await get_campaign_event_publisher()
-        await publisher.publish_batch_failed(
+        await publisher.publish_batch_completed(
             campaign_id=campaign_id,
-            error=f"Concurrent slot acquisition timeout: {e}",
             processed_count=0,
+            failed_count=0,
+            batch_size=batch_size,
         )
-
-        # Update campaign state to failed
-        await db_client.update_campaign(campaign_id=campaign_id, state="failed")
-        raise
 
     except Exception as e:
         logger.error(f"Error processing batch for campaign {campaign_id}: {e}")

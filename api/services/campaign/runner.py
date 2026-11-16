@@ -55,14 +55,20 @@ class CampaignRunnerService:
         logger.info(f"Campaign {campaign_id} paused")
 
     async def resume_campaign(self, campaign_id: int) -> None:
-        """Resumes paused campaign"""
+        """Resumes a paused campaign, or restarts one that failed."""
+        # Get campaign
         campaign = await db_client.get_campaign_by_id(campaign_id)
         if not campaign:
             raise ValueError(f"Campaign {campaign_id} not found")
 
+        if campaign.state == "failed":
+            await self._restart_failed_campaign(campaign)
+            return
+
         if campaign.state != "paused":
             raise ValueError(
-                f"Campaign must be in 'paused' state to resume, current state: {campaign.state}"
+                f"Campaign must be in 'paused' or 'failed' state to resume, "
+                f"current state: {campaign.state}"
             )
 
         # Update state to running. Do not queue batch since campaign orchestrator's
@@ -73,6 +79,33 @@ class CampaignRunnerService:
         await circuit_breaker.reset(campaign_id)
 
         logger.info(f"Campaign {campaign_id} resumed")
+
+    async def _restart_failed_campaign(self, campaign) -> None:
+        """Recover a failed campaign instead of forcing a delete and recreate.
+
+        Failures are usually transient (storage blip, no call capacity). When no
+        rows were ever queued, the source sync never finished and is re-run;
+        otherwise the remaining rows are still in the queue and processing just
+        continues from where it stopped.
+        """
+        campaign_id = campaign.id
+        await circuit_breaker.reset(campaign_id)
+
+        if await db_client.count_queued_runs(campaign_id) > 0:
+            await db_client.update_campaign(campaign_id=campaign_id, state="running")
+            logger.info(
+                f"Campaign {campaign_id} restarted from its existing queued rows"
+            )
+            return
+
+        await db_client.update_campaign(
+            campaign_id=campaign_id,
+            state="syncing",
+            source_sync_status="in_progress",
+            source_sync_error=None,
+        )
+        await enqueue_job(FunctionNames.SYNC_CAMPAIGN_SOURCE, campaign_id)
+        logger.info(f"Campaign {campaign_id} restarted, re-running source sync")
 
     async def get_campaign_status(self, campaign_id: int) -> Dict[str, Any]:
         """Returns detailed campaign status"""

@@ -692,7 +692,7 @@ async def resume_campaign(
     campaign_id: int,
     user: UserModel = Depends(get_user),
 ) -> CampaignResponse:
-    """Resume a paused campaign"""
+    """Resume a paused campaign, or retry a campaign that failed"""
     # Check if organization has TELEPHONY_CONFIGURATION configured
     twilio_config = await db_client.get_configuration(
         user.selected_organization_id,

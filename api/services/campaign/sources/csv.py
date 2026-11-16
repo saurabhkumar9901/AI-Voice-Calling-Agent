@@ -3,7 +3,6 @@ import hashlib
 from io import StringIO
 from typing import List, Optional
 
-import httpx
 from loguru import logger
 
 from api.db import db_client
@@ -12,7 +11,7 @@ from api.services.campaign.source_sync import (
     ValidationError,
     ValidationResult,
 )
-from api.services.storage import storage_fs
+from api.services.campaign.sources.download import fetch_source_bytes
 
 
 class CSVSyncService(CampaignSourceSyncService):
@@ -20,23 +19,8 @@ class CSVSyncService(CampaignSourceSyncService):
 
     async def _fetch_csv_data(self, file_key: str) -> List[List[str]]:
         """Download and parse CSV file from storage. Returns all rows including header."""
-        signed_url = await storage_fs.aget_signed_url(
-            file_key, expiration=3600, use_internal_endpoint=True
-        )
-
-        if not signed_url:
-            raise ValueError(f"Failed to access CSV file: {file_key}")
-
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(signed_url)
-                response.raise_for_status()
-                csv_content = response.text
-            except httpx.HTTPError as e:
-                logger.error(f"Failed to download CSV file: {e} for url: {signed_url}")
-                raise ValueError(f"Failed to download CSV file from storage: {str(e)}")
-
-        return self._parse_csv(csv_content)
+        content = await fetch_source_bytes(file_key, "CSV")
+        return self._parse_csv(content.decode("utf-8-sig", errors="replace"))
 
     async def validate_source(
         self, source_id: str, organization_id: Optional[int] = None

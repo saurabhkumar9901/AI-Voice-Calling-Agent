@@ -171,6 +171,10 @@ services:
       # Must match api's mount: completion jobs read the /tmp files produced
       # by the pipeline running in the api container.
       - shared-tmp:/tmp
+      # Reuse the local sentiment model (~1GB) across restarts. Without this
+      # every new worker container re-downloads it at startup and blocks job
+      # processing until the download finishes.
+      - hf-cache:/root/.cache/huggingface
     environment:
       ENVIRONMENT: "local"
       LOG_LEVEL: "INFO"
@@ -229,6 +233,7 @@ volumes:
   redis_data:
   minio_data:
   shared-tmp:
+  hf-cache:
 networks:
   app-network:
     driver: bridge

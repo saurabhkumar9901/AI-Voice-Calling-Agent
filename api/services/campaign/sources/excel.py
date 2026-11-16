@@ -3,7 +3,6 @@ from datetime import date, datetime
 from io import BytesIO
 from typing import List, Optional
 
-import httpx
 from loguru import logger
 
 from api.db import db_client
@@ -12,7 +11,7 @@ from api.services.campaign.source_sync import (
     ValidationError,
     ValidationResult,
 )
-from api.services.storage import storage_fs
+from api.services.campaign.sources.download import fetch_source_bytes
 
 # Reserved context variable names produced from the column mapping.
 MAPPED_NAME_KEY = "name"
@@ -41,22 +40,7 @@ class ExcelSyncService(CampaignSourceSyncService):
 
         Returns all rows including the header row.
         """
-        signed_url = await storage_fs.aget_signed_url(
-            file_key, expiration=3600, use_internal_endpoint=True
-        )
-
-        if not signed_url:
-            raise ValueError(f"Failed to access Excel file: {file_key}")
-
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(signed_url)
-                response.raise_for_status()
-                content = response.content
-            except httpx.HTTPError as e:
-                logger.error(f"Failed to download Excel file: {e} for url: {signed_url}")
-                raise ValueError(f"Failed to download Excel file from storage: {str(e)}")
-
+        content = await fetch_source_bytes(file_key, "Excel")
         return self._parse_excel(content, file_key)
 
     def _parse_excel(self, content: bytes, file_key: str = "") -> List[List[str]]:

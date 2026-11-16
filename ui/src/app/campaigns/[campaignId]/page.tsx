@@ -237,6 +237,9 @@ export default function CampaignDetailPage() {
     // Handle resume campaign
     const handleResume = async () => {
         if (!user) return;
+        // A failed campaign is restarted through the same endpoint; it re-runs
+        // the source sync or continues from the rows already queued.
+        const wasFailed = campaign?.state === 'failed';
         setIsExecutingAction(true);
         try {
             const accessToken = await getAccessToken();
@@ -251,10 +254,10 @@ export default function CampaignDetailPage() {
 
             if (response.data) {
                 setCampaign(response.data);
-                toast.success('Campaign resumed');
+                toast.success(wasFailed ? 'Campaign restarted' : 'Campaign resumed');
             } else if (response.error) {
                 // Extract error message from response
-                let errorMsg = 'Failed to resume campaign';
+                let errorMsg = wasFailed ? 'Failed to restart campaign' : 'Failed to resume campaign';
                 if (typeof response.error === 'string') {
                     errorMsg = response.error;
                 } else if (response.error && typeof response.error === 'object') {
@@ -264,7 +267,7 @@ export default function CampaignDetailPage() {
             }
         } catch (error) {
             console.error('Failed to resume campaign:', error);
-            toast.error('Failed to resume campaign');
+            toast.error(wasFailed ? 'Failed to restart campaign' : 'Failed to resume campaign');
         } finally {
             setIsExecutingAction(false);
         }
@@ -389,6 +392,16 @@ export default function CampaignDetailPage() {
                         <Button onClick={handleResume} disabled={isExecutingAction}>
                             <RefreshCw className="h-4 w-4 mr-2" />
                             Resume Campaign
+                        </Button>
+                    </div>
+                );
+            case 'failed':
+                return (
+                    <div className="flex items-center gap-2">
+                        {editButton}
+                        <Button onClick={handleResume} disabled={isExecutingAction}>
+                            <RefreshCw className="h-4 w-4 mr-2" />
+                            Retry Campaign
                         </Button>
                     </div>
                 );
