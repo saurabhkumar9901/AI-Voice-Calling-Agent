@@ -24,6 +24,11 @@ from api.utils.common import get_backend_endpoints
 class CampaignCallDispatcher:
     """Manages rate-limited and concurrent-limited call dispatching"""
 
+    # Keep each batch comfortably inside ARQ's default 300s job timeout. The
+    # remaining budget covers the 60s from-number wait plus the provider call,
+    # so a batch can hand unsent runs back instead of being cancelled.
+    batch_dispatch_timeout = 180.0
+
     def __init__(self):
         self.default_concurrent_limit = int(DEFAULT_ORG_CONCURRENCY_LIMIT)
 
@@ -87,7 +92,16 @@ class CampaignCallDispatcher:
             logger.warning(f"Failed to initialize from_number pool: {e}")
 
         processed_count = 0
+        batch_deadline = time.monotonic() + self.batch_dispatch_timeout
         for i, queued_run in enumerate(queued_runs):
+            if time.monotonic() >= batch_deadline:
+                logger.info(
+                    f"Campaign {campaign_id} batch reached its dispatch time budget, "
+                    f"leaving {len(queued_runs) - i} runs queued for the next batch"
+                )
+                await self._revert_to_queued(queued_runs[i:])
+                break
+
             try:
                 # Apply rate limiting, i.e lets not initiate more than rate_limit_per_second
                 # calls per second. It is different than concurrency limit.
@@ -95,9 +109,12 @@ class CampaignCallDispatcher:
                     campaign.organization_id, campaign.rate_limit_per_second
                 )
 
-                # Acquire concurrent slot - waits until a slot is available
+                # Acquire concurrent slot - waits until a slot is available,
+                # but never past this batch's dispatch budget.
                 slot_id = await self.acquire_concurrent_slot(
-                    campaign.organization_id, campaign
+                    campaign.organization_id,
+                    campaign,
+                    timeout=batch_deadline - time.monotonic(),
                 )
 
                 # Dispatch the call
@@ -118,23 +135,22 @@ class CampaignCallDispatcher:
                     campaign_id=campaign_id, processed_rows=campaign.processed_rows + 1
                 )
 
-            except (ConcurrentSlotAcquisitionError, PhoneNumberPoolExhaustedError):
-                # Revert all unprocessed runs (current and remaining) back to queued
-                # so they can be picked up again when campaign is resumed
-                for unprocessed_run in queued_runs[i:]:
-                    try:
-                        await db_client.update_queued_run(
-                            queued_run_id=unprocessed_run.id,
-                            state="queued",
-                        )
-                        logger.info(
-                            f"Reverted queued run {unprocessed_run.id} back to queued state"
-                        )
-                    except Exception as revert_error:
-                        logger.error(
-                            f"Failed to revert queued run {unprocessed_run.id}: {revert_error}"
-                        )
-                # Re-raise to propagate to process_campaign_batch
+            except (ConcurrentSlotAcquisitionError, PhoneNumberPoolExhaustedError) as e:
+                # No call capacity right now (all from-numbers or concurrent
+                # slots are busy). Leave the unsent runs queued and let the
+                # orchestrator start the next batch: this is transient and must
+                # not fail the campaign.
+                logger.warning(
+                    f"Campaign {campaign_id} is at call capacity ({e}); "
+                    f"leaving {len(queued_runs) - i} runs queued for the next batch"
+                )
+                await self._revert_to_queued(queued_runs[i:])
+                break
+
+            except asyncio.CancelledError:
+                # ARQ cancels the job on timeout. Return unsent runs to the
+                # queue instead of leaving them stuck in 'processing'.
+                await self._revert_to_queued(queued_runs[i:])
                 raise
 
             except Exception as e:
@@ -156,6 +172,22 @@ class CampaignCallDispatcher:
                     )
 
         return processed_count
+
+    async def _revert_to_queued(self, queued_runs: list[QueuedRunModel]) -> None:
+        """Return claimed runs to the queue so a later batch can retry them."""
+        for queued_run in queued_runs:
+            try:
+                await db_client.update_queued_run(
+                    queued_run_id=queued_run.id,
+                    state="queued",
+                )
+                logger.info(
+                    f"Reverted queued run {queued_run.id} back to queued state"
+                )
+            except Exception as revert_error:
+                logger.error(
+                    f"Failed to revert queued run {queued_run.id}: {revert_error}"
+                )
 
     async def dispatch_call(
         self, queued_run: QueuedRunModel, campaign: any, slot_id: str

@@ -326,6 +326,8 @@ class TestProcessBatchBasic:
 
             assert processed_count == 5
             assert len(processed_runs) == 5
+            # Regular runs are claimed in ascending id order (source row order).
+            assert processed_runs == campaign_test_data.queued_run_ids[:5]
 
 
 class TestProcessBatchConcurrency:

@@ -1,7 +1,10 @@
 """ARQ worker configuration - setup logging before importing tasks"""
 
+import asyncio
 import ssl
 from urllib.parse import urlparse
+
+from loguru import logger
 
 from api.constants import REDIS_URL
 
@@ -12,7 +15,7 @@ from api.tasks.function_names import FunctionNames
 setup_logging()
 
 # Now import ARQ and task dependencies
-from arq import create_pool, cron
+from arq import create_pool, cron, func
 from arq.connections import ArqRedis, RedisSettings
 
 parsed_url = urlparse(REDIS_URL)
@@ -52,17 +55,35 @@ from api.tasks.s3_upload import (
 )
 
 
+async def preload_sentiment_model(ctx):
+    """Warm the local sentiment model before the first completion job runs.
+
+    Imported inside the hook to avoid a circular import: event handlers import
+    this module to enqueue jobs.
+    """
+    try:
+        from api.services.call_insights import warm_sentiment_model
+
+        await asyncio.to_thread(warm_sentiment_model)
+    except Exception as e:
+        logger.warning(f"Failed to preload sentiment model: {e}")
+
+
 class WorkerSettings:
     functions = [
         run_integrations_post_workflow_run,
         upload_voicemail_audio_to_s3,
-        process_workflow_completion,
+        # Insights can run a local sentiment model on CPU; give this job more
+        # headroom than ARQ's 300s default so integrations and cost calculation
+        # still run after a slow analysis.
+        func(process_workflow_completion, timeout=600),
         sync_campaign_source,
         process_campaign_batch,
         process_knowledge_base_document,
         check_due_callbacks,
         place_callback_call,
     ]
+    on_startup = preload_sentiment_model
     # Poll every minute for due follow-up callbacks.
     cron_jobs = [cron(check_due_callbacks, minute=set(range(60)))]
     redis_settings = REDIS_SETTINGS

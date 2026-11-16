@@ -569,7 +569,8 @@ class CampaignClient(BaseDBClient):
         processing the same runs. It:
         1. Prioritizes scheduled retries that are due
         2. Falls back to regular queued runs if more slots available
-        3. Locks selected rows and marks them as 'processing' atomically
+        3. Processes runs in ascending id order, i.e. the order they were synced
+        4. Locks selected rows and marks them as 'processing' atomically
 
         Returns: List of claimed QueuedRunModel objects
         """
@@ -585,7 +586,7 @@ class CampaignClient(BaseDBClient):
                     QueuedRunModel.scheduled_for.isnot(None),
                     QueuedRunModel.scheduled_for <= scheduled_before,
                 )
-                .order_by(QueuedRunModel.scheduled_for)
+                .order_by(QueuedRunModel.scheduled_for, QueuedRunModel.id)
                 .limit(limit)
                 .with_for_update(skip_locked=True)
             )
@@ -609,7 +610,7 @@ class CampaignClient(BaseDBClient):
                         QueuedRunModel.state == "queued",
                         QueuedRunModel.scheduled_for.is_(None),
                     )
-                    .order_by(func.random())
+                    .order_by(QueuedRunModel.id)
                     .limit(remaining_slots)
                     .with_for_update(skip_locked=True)
                 )

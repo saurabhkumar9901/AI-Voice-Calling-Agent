@@ -136,6 +136,18 @@ def _load_sentiment_pipeline():
         return _sentiment_pipeline
 
 
+def warm_sentiment_model() -> None:
+    """Load the local sentiment model ahead of the first call.
+
+    Loading takes ~2 minutes on CPU; warming it from the worker's startup hook
+    keeps that cost out of the workflow-completion job's timeout.
+    """
+    try:
+        _load_sentiment_pipeline()
+    except Exception as e:
+        logger.warning(f"Could not preload local sentiment model: {e}")
+
+
 def classify_sentiment(transcript_text: str) -> str | None:
     """Classify caller intent locally. Returns display label or None."""
     text = _truncate(transcript_text, SENTIMENT_MAX_CHARS)
