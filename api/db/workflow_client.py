@@ -3,12 +3,24 @@ import json
 from typing import Optional
 
 from loguru import logger
-from sqlalchemy import func, update
+from sqlalchemy import delete, func, or_, update
 from sqlalchemy.future import select
 from sqlalchemy.orm import load_only, selectinload
 
 from api.db.base_client import BaseDBClient
-from api.db.models import WorkflowDefinitionModel, WorkflowModel, WorkflowRunModel
+from api.db.models import (
+    CampaignModel,
+    LoopTalkConversation,
+    LoopTalkTestSession,
+    WorkflowDefinitionModel,
+    WorkflowModel,
+    WorkflowRunModel,
+)
+from api.enums import WorkflowRunState
+
+
+class WorkflowDeletionBlockedError(Exception):
+    """Raised when a workflow still has dependents that prevent deletion."""
 
 
 class WorkflowClient(BaseDBClient):
@@ -375,6 +387,103 @@ class WorkflowClient(BaseDBClient):
                 raise e
             await session.refresh(workflow)
         return workflow
+
+    async def delete_workflow(
+        self,
+        workflow_id: int,
+        organization_id: int = None,
+    ) -> None:
+        """Permanently delete a workflow and its own data.
+
+        Call history (runs), LoopTalk test sessions and workflow definitions are
+        deleted with the workflow. Related rows with ON DELETE CASCADE
+        (triggers, embed tokens, callbacks, recordings) are removed by the
+        database.
+
+        Raises:
+            ValueError: If the workflow does not exist for this organization.
+            WorkflowDeletionBlockedError: If an automation still uses the
+                workflow or a call is currently running.
+        """
+        async with self.async_session() as session:
+            query = select(WorkflowModel).where(WorkflowModel.id == workflow_id)
+            if organization_id:
+                query = query.where(WorkflowModel.organization_id == organization_id)
+
+            workflow = (await session.execute(query)).scalars().first()
+            if not workflow:
+                raise ValueError(f"Workflow with ID {workflow_id} not found")
+
+            campaign_count = await session.scalar(
+                select(func.count(CampaignModel.id)).where(
+                    CampaignModel.workflow_id == workflow_id
+                )
+            )
+            if campaign_count:
+                raise WorkflowDeletionBlockedError(
+                    f"This agent is used by {campaign_count} automation(s). "
+                    "Delete them before deleting the agent."
+                )
+
+            running_count = await session.scalar(
+                select(func.count(WorkflowRunModel.id)).where(
+                    WorkflowRunModel.workflow_id == workflow_id,
+                    WorkflowRunModel.state == WorkflowRunState.RUNNING.value,
+                )
+            )
+            if running_count:
+                raise WorkflowDeletionBlockedError(
+                    "This agent has a call in progress. "
+                    "Wait for it to finish before deleting the agent."
+                )
+
+            # LoopTalk sessions reference the workflow without a cascade; their
+            # conversations in turn reference the sessions without one.
+            test_session_ids = select(LoopTalkTestSession.id).where(
+                or_(
+                    LoopTalkTestSession.actor_workflow_id == workflow_id,
+                    LoopTalkTestSession.adversary_workflow_id == workflow_id,
+                )
+            )
+            await session.execute(
+                delete(LoopTalkConversation).where(
+                    LoopTalkConversation.test_session_id.in_(test_session_ids)
+                )
+            )
+            await session.execute(
+                delete(LoopTalkTestSession).where(
+                    or_(
+                        LoopTalkTestSession.actor_workflow_id == workflow_id,
+                        LoopTalkTestSession.adversary_workflow_id == workflow_id,
+                    )
+                )
+            )
+
+            # Runs reference both the workflow and its definitions, so delete
+            # them first. workflow_definitions.workflow_id has no cascade either.
+            await session.execute(
+                delete(WorkflowRunModel).where(
+                    WorkflowRunModel.workflow_id == workflow_id
+                )
+            )
+            await session.execute(
+                delete(WorkflowDefinitionModel).where(
+                    WorkflowDefinitionModel.workflow_id == workflow_id
+                )
+            )
+            await session.execute(
+                delete(WorkflowModel).where(WorkflowModel.id == workflow_id)
+            )
+
+            try:
+                await session.commit()
+            except Exception as e:
+                await session.rollback()
+                raise e
+
+            logger.info(
+                f"Deleted workflow {workflow_id} for organization {organization_id}"
+            )
 
     async def get_workflow_run_count(self, workflow_id: int) -> int:
         """Get the count of runs for a workflow."""

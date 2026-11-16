@@ -1,11 +1,24 @@
 'use client';
 
-import { Archive, Eye, RotateCcw } from 'lucide-react';
+import { Archive, Eye, RotateCcw, Trash2 } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { useState, useTransition } from 'react';
 import { toast } from 'sonner';
 
-import { updateWorkflowStatusApiV1WorkflowWorkflowIdStatusPut } from '@/client/sdk.gen';
+import {
+    deleteWorkflowEndpointApiV1WorkflowWorkflowIdDelete,
+    updateWorkflowStatusApiV1WorkflowWorkflowIdStatusPut,
+} from '@/client/sdk.gen';
+import {
+    AlertDialog,
+    AlertDialogAction,
+    AlertDialogCancel,
+    AlertDialogContent,
+    AlertDialogDescription,
+    AlertDialogFooter,
+    AlertDialogHeader,
+    AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
 import { Button } from '@/components/ui/button';
 import {
     Table,
@@ -32,6 +45,8 @@ export function WorkflowTable({ workflows, showArchived }: WorkflowTableProps) {
     const router = useRouter();
     const [isPending, startTransition] = useTransition();
     const [loadingWorkflowId, setLoadingWorkflowId] = useState<number | null>(null);
+    const [workflowToDelete, setWorkflowToDelete] = useState<Workflow | null>(null);
+    const [deletingWorkflowId, setDeletingWorkflowId] = useState<number | null>(null);
 
     const handleView = (id: number) => {
         router.push(`/workflow/${id}`);
@@ -67,8 +82,41 @@ export function WorkflowTable({ workflows, showArchived }: WorkflowTableProps) {
         }
     };
 
+    const handleDelete = async () => {
+        if (!workflowToDelete) return;
+        const { id, name } = workflowToDelete;
+
+        setDeletingWorkflowId(id);
+
+        try {
+            const response = await deleteWorkflowEndpointApiV1WorkflowWorkflowIdDelete({
+                path: {
+                    workflow_id: id,
+                },
+            });
+
+            if (response.error) {
+                const detail = (response.error as { detail?: string })?.detail
+                    || 'Failed to delete workflow';
+                throw new Error(detail);
+            }
+
+            toast.success(`Workflow "${name}" deleted`);
+            setWorkflowToDelete(null);
+            startTransition(() => {
+                router.refresh();
+            });
+        } catch (error) {
+            console.error('Error deleting workflow:', error);
+            toast.error(error instanceof Error ? error.message : 'Failed to delete workflow');
+        } finally {
+            setDeletingWorkflowId(null);
+        }
+    };
+
     return (
-        <div className="bg-card border rounded-lg overflow-hidden shadow-sm">
+        <>
+            <div className="bg-card border rounded-lg overflow-hidden shadow-sm">
             <Table>
                 <TableHeader>
                     <TableRow>
@@ -142,12 +190,46 @@ export function WorkflowTable({ workflows, showArchived }: WorkflowTableProps) {
                                             </>
                                         )}
                                     </Button>
+                                    <Button
+                                        variant="outline"
+                                        size="sm"
+                                        onClick={() => setWorkflowToDelete(workflow)}
+                                        disabled={deletingWorkflowId === workflow.id || isPending}
+                                        className="flex items-center gap-2"
+                                        aria-label={`Delete agent ${workflow.name}`}
+                                    >
+                                        {deletingWorkflowId === workflow.id ? (
+                                            <div className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                                        ) : (
+                                            <Trash2 size={16} className="text-destructive" />
+                                        )}
+                                    </Button>
                                 </div>
                             </TableCell>
                         </TableRow>
                     ))}
                 </TableBody>
             </Table>
-        </div>
+            </div>
+            <AlertDialog open={!!workflowToDelete} onOpenChange={(open) => !open && setWorkflowToDelete(null)}>
+                <AlertDialogContent>
+                    <AlertDialogHeader>
+                        <AlertDialogTitle>Delete agent?</AlertDialogTitle>
+                        <AlertDialogDescription>
+                            {workflowToDelete ? `Delete "${workflowToDelete.name}"? This permanently removes the agent and its call history, including transcripts, summaries, and recordings. Its triggers, embed widgets, and scheduled callbacks are also removed. Automations using this agent must be deleted first. This action cannot be undone.` : ''}
+                        </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                        <AlertDialogCancel>Cancel</AlertDialogCancel>
+                        <AlertDialogAction
+                            onClick={handleDelete}
+                            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                        >
+                            {deletingWorkflowId ? 'Deleting...' : 'Delete'}
+                        </AlertDialogAction>
+                    </AlertDialogFooter>
+                </AlertDialogContent>
+            </AlertDialog>
+        </>
     );
 }

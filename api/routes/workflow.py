@@ -17,8 +17,9 @@ from starlette.background import BackgroundTask
 from api.constants import DEPLOYMENT_MODE
 from api.db import db_client
 from api.db.models import UserModel
+from api.db.workflow_client import WorkflowDeletionBlockedError
 from api.db.workflow_template_client import WorkflowTemplateClient
-from api.enums import CallType
+from api.enums import CallType, WorkflowStatus
 from api.schemas.workflow import WorkflowRunResponseSchema
 from api.services.auth.depends import get_user
 from api.services.configuration.masking import (
@@ -502,9 +503,10 @@ async def get_workflow(
 async def get_workflows_summary(
     user: UserModel = Depends(get_user),
 ) -> List[WorkflowSummaryResponse]:
-    """Get minimal workflow information (id and name only) for all workflows"""
+    """Get minimal active workflow information (id and name only) for dropdowns."""
     workflows = await db_client.get_all_workflows(
-        organization_id=user.selected_organization_id
+        organization_id=user.selected_organization_id,
+        status=WorkflowStatus.ACTIVE.value,
     )
     return [
         WorkflowSummaryResponse(id=workflow.id, name=workflow.name)
@@ -553,6 +555,28 @@ async def update_workflow_status(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/{workflow_id}")
+async def delete_workflow_endpoint(
+    workflow_id: int,
+    user: UserModel = Depends(get_user),
+):
+    """Permanently delete a workflow and its call history.
+
+    Automations that still use the workflow, and calls currently running,
+    block deletion.
+    """
+    try:
+        await db_client.delete_workflow(
+            workflow_id=workflow_id,
+            organization_id=user.selected_organization_id,
+        )
+    except WorkflowDeletionBlockedError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"status": "deleted", "workflow_id": workflow_id}
 
 
 @router.put("/{workflow_id}")
