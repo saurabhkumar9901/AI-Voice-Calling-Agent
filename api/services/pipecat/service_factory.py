@@ -1,3 +1,4 @@
+import os
 from typing import TYPE_CHECKING
 
 from fastapi import HTTPException
@@ -635,17 +636,59 @@ def create_s2s_service_from_provider(provider: str, model: str, api_key: str, vo
     """Create an S2S service from explicit parameters."""
     logger.info(f"Creating S2S service: provider={provider}, model={model}, voice={voice}")
     if provider == ServiceProviders.GOOGLE.value:
+        from google.genai.types import EndSensitivity, StartSensitivity, ThinkingConfig
         from pipecat.services.google.gemini_live import GeminiLiveLLMService
+
+        thinking_level = os.getenv("GEMINI_LIVE_THINKING_LEVEL", "MINIMAL").upper()
         return GeminiLiveLLMService(
             api_key=api_key,
             settings=GeminiLiveLLMService.Settings(
                 model=model,
                 voice=voice or "Puck",
                 temperature=0.7,  # Default for Gemini Voice, slightly more expressive
+                vad=_gemini_live_telephony_aad(StartSensitivity, EndSensitivity),
+                input_sample_rate=int(os.getenv("GEMINI_LIVE_INPUT_SAMPLE_RATE", "16000")),
+                # 3.1 Flash Live already defaults to minimal thinking; pin it so
+                # a model swap can't silently reintroduce reasoning latency.
+                thinking=ThinkingConfig(thinking_level=thinking_level),
             )
         )
     else:
         raise HTTPException(status_code=400, detail=f"Invalid S2S provider {provider}")
+
+
+def _gemini_live_telephony_aad(start_sensitivity_cls, end_sensitivity_cls):
+    """Automatic activity detection tuned for 8 kHz telephony lines.
+
+    Gemini defaults to START_SENSITIVITY_HIGH / END_SENSITIVITY_HIGH. On a
+    phone line the constant low-level noise is enough to open a user turn, so
+    the server never commits end-of-speech: it defers the greeting and then
+    self-interrupts the moment it starts speaking. Starting with LOW start
+    sensitivity keeps line noise from opening a turn.
+
+    Overridable via env so AAD can be retuned on a deployment without a code
+    change.
+    """
+    from pipecat.services.google.gemini_live import GeminiVADParams
+
+    return GeminiVADParams(
+        start_sensitivity=getattr(
+            start_sensitivity_cls,
+            os.getenv("GEMINI_LIVE_START_SENSITIVITY", "START_SENSITIVITY_LOW"),
+            start_sensitivity_cls.START_SENSITIVITY_LOW,
+        ),
+        end_sensitivity=getattr(
+            end_sensitivity_cls,
+            os.getenv("GEMINI_LIVE_END_SENSITIVITY", "END_SENSITIVITY_HIGH"),
+            end_sensitivity_cls.END_SENSITIVITY_HIGH,
+        ),
+        prefix_padding_ms=int(os.getenv("GEMINI_LIVE_PREFIX_PADDING_MS", "20")),
+        # Google recommends 500-800 ms here and warns that values below 500 ms
+        # fragment turns, which hurts transcription and response quality. Model
+        # time-to-first-audio dominates call latency anyway, so keep the safe
+        # value; override with GEMINI_LIVE_SILENCE_DURATION_MS if needed.
+        silence_duration_ms=int(os.getenv("GEMINI_LIVE_SILENCE_DURATION_MS", "500")),
+    )
 
 
 def create_s2s_service(user_config):

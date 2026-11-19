@@ -230,6 +230,9 @@ class PipecatEngine:
                 self.llm._tools_from_init = adapter.from_standard_tools(tools_schema)
 
             if getattr(self.llm, "_session", None) is not None:
+                logger.info(
+                    "Reconnecting Gemini Live session to apply updated node context"
+                )
                 await self.llm._reconnect()
         else:
             await self.llm._update_settings(LLMSettings(system_instruction=system_prompt))

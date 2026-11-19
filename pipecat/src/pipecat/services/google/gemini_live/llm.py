@@ -21,12 +21,14 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 
+import numpy as np
 from loguru import logger
 from PIL import Image
 from pydantic import BaseModel, Field
 
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.adapters.services.gemini_adapter import GeminiLLMAdapter
+from pipecat.audio.utils import create_stream_resampler
 from pipecat.frames.frames import (
     AggregationType,
     BotStartedSpeakingFrame,
@@ -615,6 +617,10 @@ class GeminiLiveLLMSettings(LLMSettings):
         language: Language for generation.
         media_resolution: Media resolution setting.
         vad: Voice activity detection parameters.
+        input_sample_rate: Sample rate to upsample/downsample user audio to
+            before sending it to the Live API. ``0`` (the default) sends audio
+            at whatever rate the pipeline provides. Gemini Live expects 16 kHz
+            PCM input; telephony pipelines often run at 8 kHz.
         context_window_compression: Context window compression configuration.
         thinking: Thinking configuration.
         enable_affective_dialog: Whether to enable affective dialog.
@@ -626,6 +632,7 @@ class GeminiLiveLLMSettings(LLMSettings):
     language: Language | str | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     media_resolution: GeminiMediaResolution | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     vad: GeminiVADParams | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    input_sample_rate: int | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     context_window_compression: ContextWindowCompressionParams | dict | _NotGiven = field(
         default_factory=lambda: NOT_GIVEN
     )
@@ -733,6 +740,7 @@ class GeminiLiveLLMService(LLMService):
             language="en-US",
             media_resolution=GeminiMediaResolution.UNSPECIFIED,
             vad=None,
+            input_sample_rate=0,
             context_window_compression={},
             thinking={},
             enable_affective_dialog=False,
@@ -802,6 +810,8 @@ class GeminiLiveLLMService(LLMService):
         self._connection_task = None
 
         self._disconnecting = False
+        self._reconnect_lock = asyncio.Lock()
+        self._dropped_audio_frames = 0
         self._run_llm_when_session_ready = False
 
         self._user_is_speaking = False
@@ -823,6 +833,18 @@ class GeminiLiveLLMService(LLMService):
             else "en-US"
         )
         self._vad_params = self._settings.vad
+
+        # Gemini Live expects 16 kHz PCM input. Telephony pipelines run at
+        # 8 kHz, so resample on the way in when a target rate is configured.
+        self._input_sample_rate = self._settings.input_sample_rate or 0
+        self._input_resampler = None
+        self._input_resample_logged = False
+
+        # Latency instrumentation: when did the server declare end of speech,
+        # and when did we actually get the first audio chunk back.
+        self._last_activity_end_at: Optional[float] = None
+        self._first_audio_logged_for_turn = True
+        self._last_voiced_audio_at: Optional[float] = None
 
         # Reconnection tracking
         self._consecutive_failures = 0
@@ -1174,6 +1196,7 @@ class GeminiLiveLLMService(LLMService):
         if self._session:
             # Here we assume that if we have a client, we are connected. We
             # handle disconnections in the send/recv code paths.
+            logger.debug("Already connected to Gemini service; skipping connect")
             return
 
         if session_resumption_handle:
@@ -1265,6 +1288,14 @@ class GeminiLiveLLMService(LLMService):
                     config.realtime_input_config = RealtimeInputConfig(
                         automatic_activity_detection=vad_config
                     )
+                    logger.info(
+                        "Gemini AAD config: "
+                        f"disabled={vad_config.disabled} "
+                        f"start={vad_config.start_of_speech_sensitivity} "
+                        f"end={vad_config.end_of_speech_sensitivity} "
+                        f"prefix_padding_ms={vad_config.prefix_padding_ms} "
+                        f"silence_duration_ms={vad_config.silence_duration_ms}"
+                    )
 
             # Add system instruction and tools to configuration, if provided.
             # These settings from the context take precedence over the ones
@@ -1310,46 +1341,80 @@ class GeminiLiveLLMService(LLMService):
                     async for message in turn:
                         # Reset failure counter if connection has been stable
                         self._check_and_reset_failure_counter()
-
-                        if message.server_content and message.server_content.interrupted:
-                            # NOTE: while the service triggers interruptions in
-                            # the specific case of barge-ins, it does *not*
-                            # emit UserStarted/StoppedSpeakingFrames, as the
-                            # Gemini Live API does not give us broadly reliable
-                            # signals to base those off of. Pipelines that
-                            # require turn tracking (like those using context
-                            # aggregators) still need an independent way to
-                            # track turns, such as local Silero VAD in
-                            # combination with the context aggregator default
-                            # turn strategies.
-                            logger.debug("Gemini VAD: interrupted signal received")
-                            await self.broadcast_interruption()
-                        elif message.server_content and message.server_content.model_turn:
-                            await self._handle_msg_model_turn(message)
-                        elif (
-                            message.server_content
-                            and message.server_content.turn_complete
-                            and message.usage_metadata
-                        ):
-                            await self._handle_msg_turn_complete(message)
-                            await self._handle_msg_usage_metadata(message)
-                        elif message.server_content and message.server_content.input_transcription:
-                            await self._handle_msg_input_transcription(message)
-                        elif message.server_content and message.server_content.output_transcription:
-                            await self._handle_msg_output_transcription(message)
-                        elif message.server_content and message.server_content.grounding_metadata:
-                            await self._handle_msg_grounding_metadata(message)
-                        elif message.tool_call:
-                            await self._handle_msg_tool_call(message)
-                        elif message.session_resumption_update:
-                            self._handle_msg_resumption_update(message)
+                        try:
+                            await self._handle_server_message(message)
+                        except Exception as e:
+                            # A bug while handling one message must not tear
+                            # down the live session. Reconnecting here drops
+                            # the response that is already in flight, and the
+                            # caller then hears silence until they speak again.
+                            logger.exception(f"Error handling Gemini message: {e}")
                 except Exception as e:
                     if not self._disconnecting:
                         should_reconnect = await self._handle_connection_error(e)
                         if should_reconnect:
-                            await self._reconnect()
-                            return  # Exit this connection handler, _reconnect will start a new one
+                            # Reconnect from a separate task: _disconnect()
+                            # cancels self._connection_task, which is the task
+                            # we are currently running in.
+                            self.create_task(self._reconnect(), "gemini_reconnect")
+                            return  # Exit this connection handler
                     break
+
+    async def _handle_server_message(self, message: LiveServerMessage):
+        """Dispatch a single message received from the Gemini Live session."""
+        if message.voice_activity:
+            activity = message.voice_activity.voice_activity_type
+            activity_value = getattr(activity, "value", activity)
+            logger.debug(f"Gemini voice activity: {activity}")
+            if activity_value == "ACTIVITY_END":
+                # Start the latency clock at the moment the server declares end
+                # of user speech. The delta to the first audio chunk is Gemini's
+                # own TTFT; the delta from the last voiced input frame is the
+                # end-of-speech detection cost.
+                self._last_activity_end_at = time.monotonic()
+                self._first_audio_logged_for_turn = False
+                if self._last_voiced_audio_at is not None:
+                    logger.info(
+                        "Gemini end-of-speech detection: "
+                        f"{self._last_activity_end_at - self._last_voiced_audio_at:.3f}s "
+                        "after last voiced input frame"
+                    )
+            elif activity_value == "ACTIVITY_START":
+                self._last_activity_end_at = None
+                self._first_audio_logged_for_turn = True
+
+        if message.server_content and message.server_content.waiting_for_input:
+            logger.info("Gemini is waiting for more input; no response generated")
+
+        if message.server_content and message.server_content.interrupted:
+            # NOTE: while the service triggers interruptions in the specific
+            # case of barge-ins, it does *not* emit UserStarted/StoppedSpeaking
+            # Frames, as the Gemini Live API does not give us broadly reliable
+            # signals to base those off of. Pipelines that require turn tracking
+            # (like those using context aggregators) still need an independent
+            # way to track turns, such as local Silero VAD in combination with
+            # the context aggregator default turn strategies.
+            logger.debug("Gemini VAD: interrupted signal received")
+            await self.broadcast_interruption()
+        elif message.server_content and message.server_content.model_turn:
+            await self._handle_msg_model_turn(message)
+        elif (
+            message.server_content
+            and message.server_content.turn_complete
+            and message.usage_metadata
+        ):
+            await self._handle_msg_turn_complete(message)
+            await self._handle_msg_usage_metadata(message)
+        elif message.server_content and message.server_content.input_transcription:
+            await self._handle_msg_input_transcription(message)
+        elif message.server_content and message.server_content.output_transcription:
+            await self._handle_msg_output_transcription(message)
+        elif message.server_content and message.server_content.grounding_metadata:
+            await self._handle_msg_grounding_metadata(message)
+        elif message.tool_call:
+            await self._handle_msg_tool_call(message)
+        elif message.session_resumption_update:
+            self._handle_msg_resumption_update(message)
 
     def _check_and_reset_failure_counter(self):
         """Check if connection has been stable long enough to reset the failure counter.
@@ -1396,39 +1461,99 @@ class GeminiLiveLLMService(LLMService):
             return True
 
     async def _reconnect(self):
-        """Reconnect to Gemini Live API."""
-        await self._disconnect()
-        await self._connect(session_resumption_handle=self._session_resumption_handle)
+        """Reconnect to Gemini Live API.
+
+        Serialized so concurrent node transitions cannot race the session
+        teardown/setup and leave the service without a connection.
+        """
+        async with self._reconnect_lock:
+            logger.info("Reconnecting to Gemini service")
+            try:
+                await self._disconnect()
+                await self._connect(
+                    session_resumption_handle=self._session_resumption_handle
+                )
+            except Exception as e:
+                logger.error(f"Error reconnecting to Gemini service: {e}")
+                await self.push_error(
+                    error_msg=f"Error reconnecting: {e}", exception=e
+                )
 
     async def _disconnect(self):
-        """Disconnect from Gemini Live API and clean up resources."""
+        """Disconnect from Gemini Live API and clean up resources.
+
+        Always clears the session and the disconnecting flag, even when
+        closing the old session fails. Otherwise _connect() would early-return
+        on a stale session while _send_user_audio() drops every frame, leaving
+        the bot permanently deaf for the rest of the call.
+        """
         logger.info("Disconnecting from Gemini service")
+        self._disconnecting = True
+        connection_task = self._connection_task
+        self._connection_task = None
         try:
-            self._disconnecting = True
             await self.stop_all_metrics()
-            if self._connection_task:
-                await self.cancel_task(self._connection_task, timeout=1.0)
-                self._connection_task = None
+            # _disconnect() can be invoked from the connection task itself;
+            # cancelling the current task would deadlock until the timeout.
+            if connection_task and connection_task is not asyncio.current_task():
+                await self.cancel_task(connection_task, timeout=1.0)
             if self._transcription_timeout_task:
                 await self.cancel_task(self._transcription_timeout_task)
                 self._transcription_timeout_task = None
             if self._session:
-                await self._session.close()
-                self._session = None
+                try:
+                    await self._session.close()
+                except Exception as e:
+                    logger.warning(f"Error closing Gemini session: {e}")
             self._completed_tool_calls = set()
-            self._disconnecting = False
         except Exception as e:
+            logger.error(f"Error disconnecting from Gemini service: {e}")
             await self.push_error(error_msg=f"Error disconnecting: {e}", exception=e)
+        finally:
+            self._session = None
+            self._disconnecting = False
 
     async def _send_user_audio(self, frame):
         """Send user audio frame to Gemini Live API."""
         if self._audio_input_paused or self._disconnecting or not self._session:
+            self._dropped_audio_frames += 1
+            if self._dropped_audio_frames == 1 or self._dropped_audio_frames % 100 == 0:
+                logger.warning(
+                    "Dropping user audio: "
+                    f"frames={self._dropped_audio_frames} "
+                    f"paused={self._audio_input_paused} "
+                    f"disconnecting={self._disconnecting} "
+                    f"session={'connected' if self._session else 'none'}"
+                )
             return
+
+        self._dropped_audio_frames = 0
+
+        audio = frame.audio
+        sample_rate = frame.sample_rate
+
+        # Track the last frame that actually contained speech so we can measure
+        # how long the server waits before declaring end of speech.
+        try:
+            samples = np.frombuffer(audio, dtype=np.int16)
+            if samples.size and int(np.abs(samples).max()) > 300:
+                self._last_voiced_audio_at = time.monotonic()
+        except Exception:
+            pass
+
+        # Gemini Live expects 16 kHz PCM input. Sending 8 kHz telephony audio
+        # makes the server run its VAD and ASR over half the samples it expects,
+        # which shows up as slow/false turn detection.
+        if self._input_sample_rate and sample_rate != self._input_sample_rate:
+            audio = await self._resample_input_audio(
+                audio, sample_rate, self._input_sample_rate
+            )
+            sample_rate = self._input_sample_rate
 
         # Send all audio to Gemini
         try:
             await self._session.send_realtime_input(
-                audio=Blob(data=frame.audio, mime_type=f"audio/pcm;rate={frame.sample_rate}")
+                audio=Blob(data=audio, mime_type=f"audio/pcm;rate={sample_rate}")
             )
         except Exception as e:
             await self._handle_send_error(e)
@@ -1442,6 +1567,17 @@ class GeminiLiveLLMService(LLMService):
             self._user_audio_buffer.extend(audio)
             length = int((frame.sample_rate * frame.num_channels * 2) * 0.5)
             self._user_audio_buffer = self._user_audio_buffer[-length:]
+
+    async def _resample_input_audio(self, audio: bytes, in_rate: int, out_rate: int) -> bytes:
+        """Resample user audio to the rate Gemini Live expects."""
+        if self._input_resampler is None:
+            self._input_resampler = create_stream_resampler()
+        if not self._input_resample_logged:
+            logger.info(
+                f"Resampling Gemini Live input audio: {in_rate}Hz -> {out_rate}Hz"
+            )
+            self._input_resample_logged = True
+        return await self._input_resampler.resample(audio, in_rate, out_rate)
 
     async def _send_user_text(self, text: str):
         """Send user text via Gemini Live API's realtime input stream.
@@ -1598,10 +1734,9 @@ class GeminiLiveLLMService(LLMService):
                     # Regular text response
                     self._bot_text_buffer += text
                     self._search_result_buffer += text  # Also accumulate for grounding
-                    
-                    from loguru import logger
+
                     logger.debug(f"[Transcription:assistant] [{text}]")
-                    
+
                     frame = LLMTextFrame(text=text)
                     await self.push_frame(frame)
                     
@@ -1623,20 +1758,27 @@ class GeminiLiveLLMService(LLMService):
             elif inline_data.mime_type == "audio/pcm":
                 # Sample rate not provided in mime type, assume default
                 if not hasattr(self, "_sample_rate_warning_logged"):
-                    from loguru import logger
                     logger.warning(
                         f"Sample rate not provided in mime type '{inline_data.mime_type}', assuming rate of {self._sample_rate}"
                     )
                     self._sample_rate_warning_logged = True
             else:
                 # Unrecognized format
-                from loguru import logger
                 logger.warning(f"Unrecognized server_content format {inline_data.mime_type}")
                 continue
 
             audio = inline_data.data
             if not audio:
                 continue
+
+            if not self._first_audio_logged_for_turn:
+                self._first_audio_logged_for_turn = True
+                if self._last_activity_end_at is not None:
+                    logger.info(
+                        "Gemini first audio chunk: "
+                        f"{time.monotonic() - self._last_activity_end_at:.3f}s "
+                        "after end of user speech"
+                    )
 
             if not self._bot_is_responding:
                 # Update bot responding state and send service start frame
@@ -1687,6 +1829,14 @@ class GeminiLiveLLMService(LLMService):
     @traced_gemini_live(operation="llm_response")
     async def _handle_msg_turn_complete(self, message: LiveServerMessage):
         """Handle the turn complete message."""
+        # A non-default reason means the model ended the turn without producing
+        # a full response (e.g. NEED_MORE_INPUT). This is the signal that
+        # explains "the bot went silent instead of answering".
+        reason = getattr(message.server_content, "turn_complete_reason", None)
+        reason_value = getattr(reason, "value", reason)
+        if reason_value and reason_value != "TURN_COMPLETE_REASON_UNSPECIFIED":
+            logger.info(f"Gemini turn complete reason: {reason_value}")
+
         text = self._bot_text_buffer
 
         # Trace the complete LLM response (this will be handled by the decorator)
@@ -1864,7 +2014,6 @@ class GeminiLiveLLMService(LLMService):
         # "bot-llm-text" event. So here we push an LLMTextFrame, too, but avoid
         # appending it to context to avoid context message duplication.
 
-        from loguru import logger
         logger.debug(f"[Transcription:assistant] [{text}]")
 
         # Push LLMTextFrame
