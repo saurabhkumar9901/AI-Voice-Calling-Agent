@@ -4,6 +4,7 @@ This client communicates with the Model Proxy Service (MPS) for service key mana
 Service keys are stored and managed entirely in MPS, not in the local database.
 """
 
+import asyncio
 from typing import List, Optional
 
 import httpx
@@ -18,6 +19,31 @@ class MPSServiceKeyClient:
     def __init__(self):
         self.base_url = MPS_API_URL
         self.timeout = httpx.Timeout(10.0)
+        self._client: Optional[httpx.AsyncClient] = None
+        self._client_loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def _get_async_client(self) -> httpx.AsyncClient:
+        """Return a process-wide client so repeated calls reuse TCP/TLS.
+
+        Creating a client per request paid a fresh handshake (~0.7s) on every
+        inbound call, which sat directly on the telephony answer path.
+        """
+        loop = asyncio.get_running_loop()
+        if (
+            self._client is None
+            or self._client.is_closed
+            or self._client_loop is not loop
+        ):
+            self._client = httpx.AsyncClient(timeout=self.timeout)
+            self._client_loop = loop
+        return self._client
+
+    async def aclose(self):
+        """Close the shared client. Safe to call multiple times."""
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
+        self._client = None
+        self._client_loop = None
 
     def _get_headers(
         self,
@@ -262,28 +288,28 @@ class MPSServiceKeyClient:
         Raises:
             HTTPException: If the API call fails
         """
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
-                f"{self.base_url}/api/v1/service-keys/usage",
-                json={"service_key": service_key},
-                headers=self._get_headers(organization_id, created_by),
-            )
+        client = self._get_async_client()
+        response = await client.post(
+            f"{self.base_url}/api/v1/service-keys/usage",
+            json={"service_key": service_key},
+            headers=self._get_headers(organization_id, created_by),
+        )
 
-            if response.status_code == 200:
-                data = response.json()
-                return {
-                    "total_credits_used": data.get("total_credits_used", 0.0),
-                    "remaining_credits": data.get("remaining_credits", 0.0),
-                }
-            else:
-                logger.warning(
-                    f"Failed to check service key usage: {response.status_code} - {response.text}"
-                )
-                raise httpx.HTTPStatusError(
-                    f"Failed to check service key usage: {response.text}",
-                    request=response.request,
-                    response=response,
-                )
+        if response.status_code == 200:
+            data = response.json()
+            return {
+                "total_credits_used": data.get("total_credits_used", 0.0),
+                "remaining_credits": data.get("remaining_credits", 0.0),
+            }
+        else:
+            logger.warning(
+                f"Failed to check service key usage: {response.status_code} - {response.text}"
+            )
+            raise httpx.HTTPStatusError(
+                f"Failed to check service key usage: {response.text}",
+                request=response.request,
+                response=response,
+            )
 
     async def get_usage_by_created_by(self, created_by: str) -> dict:
         """

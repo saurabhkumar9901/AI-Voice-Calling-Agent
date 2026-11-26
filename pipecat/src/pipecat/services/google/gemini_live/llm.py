@@ -1093,28 +1093,34 @@ class GeminiLiveLLMService(LLMService):
             # We got our initial context
             self._context = context
 
-            # If context contains system instruction or tools, reconnect in
-            # order to apply them.
-            # (Context-provided system instruction and tools take precedence
-            # over the ones provided at initialization time. Note that we could
-            # do more sophisticated comparisons here, but for now this is
-            # sufficient: we'll assume folks won't mean to provide these
-            # settings both in the context and at initialization time. In a
-            # future change, we could/should implement the ability to swap
-            # these settings at any point).
+            # Only reconnect when the context carries configuration the live
+            # session does not already have. Init-time values are applied by
+            # _connect(), so reconnecting here just costs ~0.5s and drops
+            # in-flight user audio at the start of every call.
             adapter: GeminiLLMAdapter = self.get_llm_adapter()
             params = adapter.get_llm_invocation_params(self._context)
             system_instruction = params["system_instruction"]
             tools = params["tools"]
+            # `tools` is either a list or the NOT_GIVEN sentinel, which is
+            # truthy, so check the container type explicitly.
+            has_tools = isinstance(tools, list) and bool(tools)
+            instruction_differs = (
+                bool(system_instruction)
+                and system_instruction != self._system_instruction_from_init
+            )
+            tools_missing = has_tools and not self._tools_from_init
             if system_instruction and self._system_instruction_from_init:
-                logger.warning(
-                    "System instruction provided both at init time and in context; using context-provided value."
-                )
-            if tools and self._tools_from_init:
-                logger.warning(
-                    "Tools provided both at init time and in context; using context-provided value."
-                )
-            if system_instruction or tools:
+                if instruction_differs:
+                    logger.info(
+                        "Context system instruction differs from the init-time value; reconnecting to apply it."
+                    )
+                else:
+                    logger.debug(
+                        "System instruction already applied at init time; skipping reconnect."
+                    )
+            if has_tools and self._tools_from_init:
+                logger.debug("Tools already applied at init time; skipping reconnect.")
+            if instruction_differs or tools_missing:
                 await self._reconnect()
 
             # Initialize our bookkeeping of already-completed tool calls in

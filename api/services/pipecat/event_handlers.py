@@ -1,3 +1,5 @@
+import asyncio
+
 from loguru import logger
 
 from api.db import db_client
@@ -18,6 +20,11 @@ from pipecat.pipeline.task import PipelineTask
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.utils.enums import EndTaskReason
 
+# Inbound quota checks run after the call is answered, concurrently with
+# pipeline setup. Wait at most this long before starting the conversation;
+# beyond that, fail open rather than leave the caller in silence.
+QUOTA_CHECK_TIMEOUT_SECONDS = 2.0
+
 
 def register_event_handlers(
     task: PipelineTask,
@@ -28,6 +35,7 @@ def register_event_handlers(
     in_memory_logs_buffer: InMemoryLogsBuffer,
     pipeline_metrics_aggregator: PipelineMetricsAggregator,
     audio_config=AudioConfig,
+    quota_task=None,
 ):
     """Register all event handlers for transport and task events.
 
@@ -55,6 +63,25 @@ def register_event_handlers(
         "initial_response_triggered": False,
     }
 
+    async def _await_quota_check():
+        """Return the deferred quota result, or None if it cannot be determined."""
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(quota_task), timeout=QUOTA_CHECK_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[run {workflow_run_id}] Inbound quota check timed out after "
+                f"{QUOTA_CHECK_TIMEOUT_SECONDS}s; allowing the call"
+            )
+            quota_task.cancel()
+            return None
+        except Exception as e:
+            logger.error(
+                f"[run {workflow_run_id}] Inbound quota check failed; allowing the call: {e}"
+            )
+            return None
+
     async def maybe_trigger_initial_response():
         """Start the conversation after both pipeline_started and client_connected events.
 
@@ -68,6 +95,26 @@ def register_event_handlers(
             and not ready_state["initial_response_triggered"]
         ):
             ready_state["initial_response_triggered"] = True
+
+            # Inbound runs defer their quota check until now (see _run_pipeline).
+            # Don't start the conversation for a caller who can't be served.
+            if quota_task is not None:
+                quota_result = await _await_quota_check()
+                logger.info(
+                    f"[run {workflow_run_id}] Inbound quota gate: "
+                    f"has_quota={getattr(quota_result, 'has_quota', None)}"
+                )
+                if quota_result is not None and not quota_result.has_quota:
+                    logger.warning(
+                        f"[run {workflow_run_id}] Ending inbound call, quota check "
+                        f"failed: {quota_result.error_message}"
+                    )
+                    await engine.end_call_with_reason(
+                        "quota_exceeded",
+                        abort_immediately=True,
+                        skip_extraction=True,
+                    )
+                    return
 
             greeting = engine.get_start_greeting()
             if greeting:

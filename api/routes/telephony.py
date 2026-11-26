@@ -34,7 +34,7 @@ from api.services.auth.depends import get_user
 from api.services.campaign.campaign_call_dispatcher import campaign_call_dispatcher
 from api.services.campaign.campaign_event_publisher import get_campaign_event_publisher
 from api.services.campaign.circuit_breaker import circuit_breaker
-from api.services.quota_service import check_dograh_quota, check_dograh_quota_by_user_id
+from api.services.quota_service import check_dograh_quota
 from api.services.telephony.call_transfer_manager import get_call_transfer_manager
 from api.services.telephony.factory import (
     get_all_telephony_providers,
@@ -437,6 +437,9 @@ async def _create_inbound_workflow_run(
             "caller_number": normalized_data.from_number,
             "called_number": normalized_data.to_number,
             "direction": "inbound",
+            # Set here because the inbound webhook no longer blocks on quota;
+            # _run_pipeline performs the check once the media stream is up.
+            "quota_check_deferred": True,
             "account_id": normalized_data.account_id,
             "provider": provider,
             "data_source": data_source,
@@ -1528,18 +1531,9 @@ async def handle_inbound_telephony(
             logger.error(f"Request validation failed: {error_type}")
             return provider_class.generate_validation_error_response(error_type)
 
-        # Check quota before processing
-        user_id = workflow_context["user_id"]
-        quota_result = await check_dograh_quota_by_user_id(user_id)
-        if not quota_result.has_quota:
-            logger.warning(
-                f"User {user_id} has exceeded quota for inbound calls: {quota_result.error_message}"
-            )
-            return provider_class.generate_validation_error_response(
-                TelephonyError.QUOTA_EXCEEDED
-            )
-
-        # Create workflow run
+        # Quota is verified inside the pipeline (see _run_pipeline). Checking it
+        # here blocks the webhook response, which delays the provider from
+        # opening the media stream and is heard as dead air after answering.
         workflow_run_id = await _create_inbound_workflow_run(
             workflow_id,
             workflow_context["user_id"],

@@ -8,6 +8,7 @@
 
 import base64
 import json
+import time
 from typing import Optional
 
 from loguru import logger
@@ -102,6 +103,12 @@ class VobizFrameSerializer(FrameSerializer):
         self._output_resampler = create_stream_resampler()
         self._hangup_attempted = False
 
+        # Latency instrumentation: output audio is only produced while the bot
+        # is speaking, so a gap in output frames marks the start of a new bot
+        # turn. Correlate this timestamp with Gemini's "first audio chunk" log
+        # to see how much delay the pipeline adds before bytes hit the wire.
+        self._last_output_audio_at: Optional[float] = None
+
     async def setup(self, frame: StartFrame):
         """Sets up the serializer with pipeline configuration.
 
@@ -135,6 +142,16 @@ class VobizFrameSerializer(FrameSerializer):
             return json.dumps(answer)
         elif isinstance(frame, AudioRawFrame):
             data = frame.audio
+
+            now = time.monotonic()
+            if self._last_output_audio_at is None or (
+                now - self._last_output_audio_at
+            ) > 0.3:
+                logger.info(
+                    f"Vobiz first output audio for turn (call={self._call_id}, "
+                    f"stream={self._stream_id})"
+                )
+            self._last_output_audio_at = now
 
             # Output: Convert PCM at frame's rate to 8kHz μ-law for Vobiz
             serialized_data = await pcm_to_ulaw(
