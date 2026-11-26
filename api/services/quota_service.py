@@ -4,7 +4,6 @@ This module provides reusable quota checking functionality that can be used
 across different endpoints (WebRTC signaling, telephony, public API triggers).
 """
 
-import time
 from dataclasses import dataclass
 
 from loguru import logger
@@ -22,13 +21,6 @@ class QuotaCheckResult:
     has_quota: bool
     error_message: str = ""
     error_code: str = ""
-
-
-# Cache positive/negative results briefly so bursts of calls (and the
-# inbound path, which checks quota after answering) don't each pay a
-# remote round trip to MPS.
-_QUOTA_CACHE_TTL_SECONDS = 60.0
-_quota_cache: dict[int, tuple[float, QuotaCheckResult]] = {}
 
 
 async def check_dograh_quota(user: UserModel) -> QuotaCheckResult:
@@ -120,35 +112,21 @@ async def check_dograh_quota(user: UserModel) -> QuotaCheckResult:
         return QuotaCheckResult(has_quota=True)
 
 
-async def check_dograh_quota_by_user_id(
-    user_id: int, *, use_cache: bool = True
-) -> QuotaCheckResult:
+async def check_dograh_quota_by_user_id(user_id: int) -> QuotaCheckResult:
     """Check Dograh quota by user ID.
 
     Convenience function that fetches the user and then checks quota.
 
     Args:
         user_id: The ID of the user to check quota for
-        use_cache: Reuse a result from the last ``_QUOTA_CACHE_TTL_SECONDS``
 
     Returns:
         QuotaCheckResult with quota status
     """
-    if use_cache:
-        cached = _quota_cache.get(user_id)
-        if cached and (time.monotonic() - cached[0]) < _QUOTA_CACHE_TTL_SECONDS:
-            return cached[1]
-
     user = await db_client.get_user_by_id(user_id)
     if not user:
         return QuotaCheckResult(
             has_quota=False,
             error_message="User not found",
         )
-
-    result = await check_dograh_quota(user)
-    # Cache definitive answers. A transient infrastructure failure should be
-    # retried on the next call rather than pinning "denied" for a minute.
-    if result.has_quota or result.error_code != "quota_check_failed":
-        _quota_cache[user_id] = (time.monotonic(), result)
-    return result
+    return await check_dograh_quota(user)

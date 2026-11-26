@@ -35,7 +35,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from api.routes.main import router as main_router
-from api.services.mps_service_key_client import mps_service_key_client
 from api.services.pipecat.tracing_config import load_all_org_langfuse_credentials
 from api.tasks.arq import get_arq_redis
 
@@ -55,7 +54,6 @@ async def lifespan(app: FastAPI):
 
     # Shutdown sequence - this runs when FastAPI is shutting down
     logger.info("Starting graceful shutdown...")
-    await mps_service_key_client.aclose()
 
 
 app = FastAPI(

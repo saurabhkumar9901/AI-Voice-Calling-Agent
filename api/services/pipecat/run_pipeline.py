@@ -52,7 +52,6 @@ from api.services.pipecat.transport_setup import (
     create_webrtc_transport,
 )
 from api.services.pipecat.ws_sender_registry import get_ws_sender
-from api.services.quota_service import check_dograh_quota_by_user_id
 from api.services.workflow.dto import ReactFlowDTO
 from api.services.workflow.pipecat_engine import PipecatEngine
 from api.services.workflow.workflow import WorkflowGraph
@@ -558,19 +557,6 @@ async def _run_pipeline(
             workflow_run_id, initial_context=merged_call_context_vars
         )
 
-    # Inbound telephony defers the quota check to here so the provider's
-    # webhook response is not blocked (that delay is dead air for the caller).
-    # Run it concurrently with pipeline setup; the greeting waits on it.
-    quota_task = None
-    if merged_call_context_vars.get("quota_check_deferred"):
-        logger.info(
-            f"[run {workflow_run_id}] Inbound quota check deferred; "
-            "checking concurrently with pipeline setup"
-        )
-        quota_task = asyncio.create_task(
-            check_dograh_quota_by_user_id(user_id), name="inbound_quota_check"
-        )
-
     # Get user configuration
     user_config = await db_client.get_user_configurations(user_id)
 
@@ -942,7 +928,6 @@ async def _run_pipeline(
         in_memory_logs_buffer=in_memory_logs_buffer,
         pipeline_metrics_aggregator=pipeline_metrics_aggregator,
         audio_config=audio_config,
-        quota_task=quota_task,
     )
 
     register_audio_data_handler(audio_buffer, workflow_run_id, in_memory_audio_buffer)
@@ -956,12 +941,5 @@ async def _run_pipeline(
     except asyncio.CancelledError:
         logger.warning("Received CancelledError in _run_pipeline")
     finally:
-        if quota_task is not None:
-            if not quota_task.done():
-                quota_task.cancel()
-            elif not quota_task.cancelled():
-                # Mark any stored exception as retrieved so it is not reported
-                # as an unhandled task error at shutdown.
-                quota_task.exception()
         await feedback_observer.cleanup()
         logger.debug(f"Cleaned up context providers for workflow run {workflow_run_id}")

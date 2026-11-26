@@ -213,13 +213,6 @@ class PipecatEngine:
         """Update LLM settings with the composed system prompt and tool list."""
         from pipecat.services.google.gemini_live import GeminiLiveLLMService
 
-        # Prompt size is a direct input to Gemini Live's time-to-first-audio;
-        # log it so latency regressions can be traced to prompt growth.
-        logger.info(
-            f"[run {self._workflow_run_id}] LLM context: "
-            f"{len(system_prompt)} chars, {len(functions)} tools"
-        )
-
         if isinstance(self.llm, GeminiLiveLLMService):
             # For Gemini Live S2S, the system instruction is part of the
             # LiveConnectConfig sent when the WebSocket session is established.
@@ -674,17 +667,9 @@ class PipecatEngine:
         self,
         reason: str,
         abort_immediately: bool = False,
-        skip_extraction: bool = False,
     ):
         """
         Centralized method to end the call with disposition mapping
-
-        Args:
-            reason: Disconnect reason used for disposition mapping.
-            abort_immediately: Push a CancelFrame instead of an EndFrame.
-            skip_extraction: Skip pending/final variable extraction. Use when
-                the call must terminate without another LLM round trip, e.g.
-                an inbound call rejected by the quota check.
         """
         if self._call_disposed:
             logger.debug(f"Call already Disposed: {self._call_disposed}")
@@ -695,7 +680,7 @@ class PipecatEngine:
         # Mute the pipeline
         self._mute_pipeline = True
 
-        if not skip_extraction and reason not in (
+        if reason not in (
             EndTaskReason.PIPELINE_ERROR.value,
             EndTaskReason.VOICEMAIL_DETECTED.value,
         ):
