@@ -755,15 +755,39 @@ class ElevenLabsTTSService(WebsocketTTSService):
 
     async def _receive_messages(self):
         """Handle incoming WebSocket messages from ElevenLabs."""
+        # Contexts that produced at least one audio chunk. Used to detect silent
+        # failures, where the server finalizes a context without any audio.
+        contexts_with_audio: set[str] = set()
+
         async for message in self._get_websocket():
             msg = json.loads(message)
 
             received_ctx_id = msg.get("contextId")
 
+            # ElevenLabs reports problems (voice not available on the account's
+            # plan, quota exceeded, invalid model, ...) as JSON error messages.
+            # Surface them instead of dropping them silently, otherwise the bot
+            # simply never speaks and there is no trace of why.
+            if msg.get("error"):
+                error_message = msg.get("message") or msg.get("error")
+                logger.error(f"{self}: ElevenLabs error: {error_message}")
+                await self.push_error(error_msg=f"ElevenLabs error: {error_message}")
+                continue
+
             # Handle final messages first, regardless of context availability
             # At the moment, this message is received AFTER the close_context message is
             # sent, so it doesn't serve any functional purpose. For now, we'll just log it.
             if msg.get("isFinal") is True:
+                if received_ctx_id and received_ctx_id not in contexts_with_audio:
+                    # Some failures (e.g. a voice that is not usable with the
+                    # API key's plan) are only reported by the server as an empty
+                    # final message, with no audio and no error payload.
+                    logger.warning(
+                        f"{self}: ElevenLabs returned no audio for context "
+                        f"{received_ctx_id}. Check the voice ID and whether the "
+                        f"API key's plan allows it."
+                    )
+                contexts_with_audio.discard(received_ctx_id)
                 logger.trace(f"Received final message for context {received_ctx_id}")
                 continue
 
@@ -782,6 +806,7 @@ class ElevenLabsTTSService(WebsocketTTSService):
                     continue
 
             if msg.get("audio"):
+                contexts_with_audio.add(received_ctx_id)
                 audio = base64.b64decode(msg["audio"])
                 frame = TTSAudioRawFrame(audio, self.sample_rate, 1, context_id=received_ctx_id)
                 await self.append_to_audio_context(received_ctx_id, frame)
